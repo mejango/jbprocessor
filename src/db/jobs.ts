@@ -1,4 +1,4 @@
-import type { Pool } from "pg";
+import type { Queryable } from "./payments.js";
 
 export interface JobRow {
   id: string;
@@ -26,7 +26,7 @@ export interface EnqueueOptions {
  * the conflict.
  */
 export async function enqueue(
-  pool: Pool,
+  pool: Queryable,
   kind: string,
   payload: unknown,
   options: EnqueueOptions = {},
@@ -67,7 +67,7 @@ export async function enqueue(
  * row as locked and skips straight to the next candidate (or, with only one
  * ready job, finds none and returns null) instead of waiting.
  */
-export async function claimNext(pool: Pool): Promise<JobRow | null> {
+export async function claimNext(pool: Queryable): Promise<JobRow | null> {
   const result = await pool.query<JobRow>(
     `UPDATE jobs SET locked_at = now(), attempts = attempts + 1
      WHERE id = (
@@ -81,7 +81,7 @@ export async function claimNext(pool: Pool): Promise<JobRow | null> {
 }
 
 /** Marks a claimed job done. */
-export async function complete(pool: Pool, id: string): Promise<void> {
+export async function complete(pool: Queryable, id: string): Promise<void> {
   await pool.query("UPDATE jobs SET done_at = now() WHERE id = $1", [id]);
 }
 
@@ -92,7 +92,7 @@ export async function complete(pool: Pool, id: string): Promise<void> {
  * marked done with `last_error` prefixed "FATAL:" so it's never retried
  * again but is still visible as a terminal failure.
  */
-export async function fail(pool: Pool, id: string, err: Error): Promise<void> {
+export async function fail(pool: Queryable, id: string, err: Error): Promise<void> {
   const message = err.message;
 
   await pool.query(
@@ -114,7 +114,7 @@ export async function fail(pool: Pool, id: string, err: Error): Promise<void> {
  * before calling complete/fail, so the job becomes claimable again. A lock
  * older than 10 minutes is assumed abandoned.
  */
-export async function reapStale(pool: Pool): Promise<void> {
+export async function reapStale(pool: Queryable): Promise<void> {
   await pool.query(
     `UPDATE jobs SET locked_at = NULL
      WHERE locked_at IS NOT NULL AND locked_at < now() - interval '10 minutes'`,

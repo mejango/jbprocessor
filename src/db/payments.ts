@@ -1,5 +1,14 @@
 import type { Pool } from "pg";
 
+/**
+ * Anything that can run a query: a `Pool` or a `PoolClient` checked out of
+ * one. Taking the narrower type lets callers run these helpers inside a
+ * transaction (`BEGIN`/`COMMIT` on a single client) rather than only on
+ * autocommit connections from the pool -- the Stripe webhook needs exactly
+ * that so a mid-handler failure rolls back its idempotency marker too.
+ */
+export type Queryable = Pick<Pool, "query">;
+
 export type PaymentState =
   | "created"
   | "paid"
@@ -37,18 +46,29 @@ export interface CreatePaymentInput {
   email: string;
   amountUsdCents: bigint;
   instant: boolean;
+  /** Beneficiary of the escrowed tokens, known before the payer ever reaches Stripe. */
+  claimAddress?: string;
+  /** Tokens the terminal previewed for this donation, as an integer string. */
+  quoteTokens?: bigint | string;
 }
 
 export async function createPayment(
-  pool: Pool,
+  pool: Queryable,
   input: CreatePaymentInput,
 ): Promise<PaymentRow> {
-  const { projectId, email, amountUsdCents, instant } = input;
+  const { projectId, email, amountUsdCents, instant, claimAddress, quoteTokens } = input;
   const result = await pool.query<PaymentRow>(
-    `INSERT INTO payments (project_id, email, amount_usd_cents, instant)
-     VALUES ($1, $2, $3, $4)
+    `INSERT INTO payments (project_id, email, amount_usd_cents, instant, claim_address, quote_tokens)
+     VALUES ($1, $2, $3, $4, $5, $6)
      RETURNING *`,
-    [projectId, email, amountUsdCents, instant],
+    [
+      projectId,
+      email,
+      amountUsdCents,
+      instant,
+      claimAddress ?? null,
+      quoteTokens === undefined ? null : quoteTokens.toString(),
+    ],
   );
   const row = result.rows[0];
   if (!row) {
@@ -111,7 +131,7 @@ export type PaymentPatch = Partial<{
  * instead of silently no-op'ing.
  */
 export async function transition(
-  pool: Pool,
+  pool: Queryable,
   id: string,
   from: PaymentState[],
   to: PaymentState,
