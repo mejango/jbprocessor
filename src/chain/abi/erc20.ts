@@ -1,7 +1,8 @@
 /**
- * Minimal ERC-20 ABI -- only the reads this service makes. Checkout uses
+ * Minimal ERC-20 ABI -- only the calls this service makes. Checkout uses
  * `allowance` to size the instant-pool headroom (how much USDC the pool
- * has approved the worker to spend on its behalf).
+ * has approved the worker to spend on its behalf); the payer worker uses
+ * `transferFrom` to actually draw against that allowance.
  */
 export const erc20Abi = [
   {
@@ -13,5 +14,16 @@ export const erc20Abi = [
       { name: "spender", type: "address" },
     ],
     outputs: [{ name: "", type: "uint256" }],
+  },
+  {
+    type: "function",
+    name: "transferFrom",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "from", type: "address" },
+      { name: "to", type: "address" },
+      { name: "amount", type: "uint256" },
+    ],
+    outputs: [{ name: "", type: "bool" }],
   },
 ] as const;

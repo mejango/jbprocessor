@@ -1,7 +1,7 @@
 import { readFile, readdir } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { Pool } from "pg";
+import { Pool, type PoolClient } from "pg";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const MIGRATIONS_DIR = join(__dirname, "migrations");
@@ -23,6 +23,42 @@ export function getPool(): Pool {
     sharedPool = new Pool({ connectionString });
   }
   return sharedPool;
+}
+
+/**
+ * Runs `fn` against a single checked-out client inside one transaction,
+ * committing on return and rolling back on throw.
+ *
+ * The point is all-or-nothing bookkeeping: the payer worker's "record the
+ * held tokens AND schedule the unlock note AND schedule the receipt" must
+ * either all land or none of them, or a crash between the state change and
+ * the enqueues would leave a payment that is `held` forever with nothing
+ * scheduled to unlock it.
+ *
+ * A `ROLLBACK` that itself fails means the connection is no longer
+ * trustworthy, so it's destroyed rather than returned to the pool.
+ */
+export async function withTransaction<T>(
+  pool: Pool,
+  fn: (db: PoolClient) => Promise<T>,
+): Promise<T> {
+  const client = await pool.connect();
+  let suspect: Error | undefined;
+  try {
+    await client.query("BEGIN");
+    const result = await fn(client);
+    await client.query("COMMIT");
+    return result;
+  } catch (err) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (rollbackErr) {
+      suspect = rollbackErr instanceof Error ? rollbackErr : new Error(String(rollbackErr));
+    }
+    throw err;
+  } finally {
+    client.release(suspect);
+  }
 }
 
 /**

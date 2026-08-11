@@ -34,6 +34,18 @@ function buildWalletClient(rpcUrl: string, privateKey: `0x${string}`) {
 export type AppPublicClient = ReturnType<typeof buildPublicClient>;
 export type AppWalletClient = ReturnType<typeof buildWalletClient>;
 
+/**
+ * The client pair every write module in `src/chain` takes: a public client to
+ * simulate and to wait for receipts, and a wallet client to sign. Reusing the
+ * concrete `App*` types (rather than viem's bare `PublicClient`/`WalletClient`)
+ * keeps `simulateContract`/`writeContract`'s overload resolution happy -- see
+ * the comment on the builders above.
+ */
+export interface ChainClients {
+  publicClient: AppPublicClient;
+  walletClient: AppWalletClient;
+}
+
 let cachedPublicClient: AppPublicClient | undefined;
 let cachedWalletClient: AppWalletClient | undefined;
 

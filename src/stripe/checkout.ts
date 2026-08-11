@@ -2,13 +2,15 @@ import type Stripe from "stripe";
 import { isAddress, type Address } from "viem";
 import { erc20Abi } from "../chain/abi/erc20.js";
 import { publicClient } from "../chain/client.js";
-import { quoteTokens, USDC_ON_BASE, type ReadContractClient } from "../chain/quote.js";
+import {
+  quoteTokens,
+  USDC_ON_BASE,
+  USDC_WEI_PER_CENT,
+  type ReadContractClient,
+} from "../chain/quote.js";
 import { createPayment, type Queryable } from "../db/payments.js";
-import { envBigInt } from "../env.js";
+import { envAddress, envBigInt, requireEnv } from "../env.js";
 import type { WalletProvider } from "../wallets/types.js";
-
-/** USDC has 6 decimals; a US cent is 10^4 of its base units. */
-const USDC_WEI_PER_CENT = 10_000n;
 
 const BPS_DENOMINATOR = 10_000n;
 
@@ -84,22 +86,6 @@ export interface CreateCheckoutSessionInput {
 export interface CreateCheckoutSessionResult {
   url: string;
   paymentId: string;
-}
-
-function requireEnv(name: string): string {
-  const value = process.env[name];
-  if (!value) {
-    throw new Error(`${name} environment variable is not set`);
-  }
-  return value;
-}
-
-function envAddress(name: string): Address {
-  const value = requireEnv(name);
-  if (!isAddress(value)) {
-    throw new Error(`${name} must be a 0x-prefixed 20-byte hex address, got: ${value}`);
-  }
-  return value;
 }
 
 /**

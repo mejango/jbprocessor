@@ -1,7 +1,7 @@
 import type { Address, Hex } from "viem";
 import { concatHex, keccak256, parseEventLogs, stringToHex } from "viem";
 import { escrowAbi } from "./abi/escrow.js";
-import type { AppPublicClient, AppWalletClient } from "./client.js";
+import type { ChainClients } from "./client.js";
 
 const ADDRESS_PATTERN = /^0x[0-9a-fA-F]{40}$/;
 const UUID_PATTERN =
@@ -81,10 +81,7 @@ export function feePaymentId(paymentId: Hex): Hex {
  * `writeContract` generics -- see the `client.ts` comment on why bare
  * `PublicClient`/`WalletClient` annotations don't typecheck here.
  */
-export interface EscrowClients {
-  publicClient: AppPublicClient;
-  walletClient: AppWalletClient;
-}
+export type EscrowClients = ChainClients;
 
 const UINT48_MAX = 2 ** 48 - 1;
 
@@ -104,7 +101,7 @@ function toUint48(value: bigint | number, fieldName: string): number {
   return asNumber;
 }
 
-function requireAccount(walletClient: AppWalletClient, fnName: string) {
+function requireAccount(walletClient: ChainClients["walletClient"], fnName: string) {
   const account = walletClient.account;
   if (!account) {
     throw new Error(`${fnName}: walletClient has no account configured`);
@@ -189,6 +186,64 @@ export async function processPayment(
   }
 
   return { txHash, tokensHeld: processedEvent.args.tokensHeld };
+}
+
+export interface EscrowEntry {
+  /** The project token the escrow is holding. */
+  token: Address;
+  /** How many project tokens are held for this payment. */
+  amount: bigint;
+  /** Unix seconds. */
+  unlockAt: number;
+  settled: boolean;
+  beneficiary: Address;
+  pendingBeneficiary: Address;
+  /** Unix seconds; 0 when no redirect is pending. */
+  redirectEffectiveAt: number;
+}
+
+/**
+ * Reads `entries(paymentId)`, returning null when the escrow has never
+ * recorded this payment.
+ *
+ * The existence sentinel is `unlockAt != 0`, matching the contract's own
+ * checks (`if (entries[paymentId].unlockAt != 0) revert EntryExists()` in
+ * `processPayment`, `if (entry.unlockAt == 0) revert NoEntry()` everywhere
+ * else) -- `processPayment` rejects a zero `unlockAt`, so a written entry
+ * always has a non-zero one. This is what lets the payer worker tell "my
+ * previous attempt crashed before sending" from "it crashed after sending",
+ * without which a retry would double-pay.
+ */
+export async function getEntry(
+  { publicClient }: Pick<EscrowClients, "publicClient">,
+  paymentId: Hex,
+): Promise<EscrowEntry | null> {
+  const [
+    token,
+    amount,
+    unlockAt,
+    settled,
+    beneficiary,
+    pendingBeneficiary,
+    redirectEffectiveAt,
+  ] = await publicClient.readContract({
+    address: escrowAddress(),
+    abi: escrowAbi,
+    functionName: "entries",
+    args: [paymentId],
+  });
+
+  if (unlockAt === 0) return null;
+
+  return {
+    token,
+    amount,
+    unlockAt,
+    settled,
+    beneficiary,
+    pendingBeneficiary,
+    redirectEffectiveAt,
+  };
 }
 
 export interface SetBeneficiaryParams {

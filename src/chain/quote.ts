@@ -4,6 +4,9 @@ import { terminalAbi } from "./abi/terminal.js";
 /** USDC on Base -- 6 decimals. */
 export const USDC_ON_BASE: Address = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
 
+/** USDC has 6 decimals; a US cent is 10^4 of its base units. */
+export const USDC_WEI_PER_CENT = 10_000n;
+
 const ZERO_ADDRESS: Address = "0x0000000000000000000000000000000000000000";
 
 const BPS_DENOMINATOR = 10_000n;
@@ -74,7 +77,16 @@ function driftToleranceBps(): bigint {
  * strictly below that floor.
  */
 export function driftExceeded(quoteAtCheckout: bigint, quoteNow: bigint): boolean {
-  const toleranceBps = driftToleranceBps();
-  const floor = (quoteAtCheckout * (BPS_DENOMINATOR - toleranceBps)) / BPS_DENOMINATOR;
-  return quoteNow < floor;
+  return quoteNow < minTokensForQuote(quoteAtCheckout);
+}
+
+/**
+ * The floor a quote may fall to before it counts as drift: `quote * (10000 -
+ * DRIFT_TOLERANCE_BPS) / 10000`. Shared by `driftExceeded` (which compares a
+ * fresh quote against the checkout quote's floor) and the payer worker (which
+ * passes the *fresh* quote's floor to the terminal as `minReturnedTokens`, so
+ * the on-chain send can't drift further between simulation and inclusion).
+ */
+export function minTokensForQuote(quote: bigint): bigint {
+  return (quote * (BPS_DENOMINATOR - driftToleranceBps())) / BPS_DENOMINATOR;
 }
