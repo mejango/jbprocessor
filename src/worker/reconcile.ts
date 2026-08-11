@@ -52,14 +52,33 @@ export interface StripeCharge {
   status: string;
 }
 
-/** The slice of the Stripe SDK the daily cross-check reads. */
+/** One dispute, as much of it as the daily chargeback sweep needs. */
+export interface StripeDispute {
+  id: string;
+  /** A bare id, or an expanded intent. Stripe returns either. */
+  payment_intent: string | { id: string } | null;
+}
+
+/** The window-and-page parameters both daily list calls take. */
+export interface StripeListParams {
+  created?: { gte?: number; lt?: number };
+  limit?: number;
+  starting_after?: string;
+}
+
+/** One page of a Stripe list, narrowed to what the reconciler reads. */
+export interface StripePage<T> {
+  data: T[];
+  has_more: boolean;
+}
+
+/** The slice of the Stripe SDK the daily cross-checks read. */
 export interface ReconcileStripe {
   charges: {
-    list(params: {
-      created?: { gte?: number; lt?: number };
-      limit?: number;
-      starting_after?: string;
-    }): Promise<{ data: StripeCharge[]; has_more: boolean }>;
+    list(params: StripeListParams): Promise<StripePage<StripeCharge>>;
+  };
+  disputes: {
+    list(params: StripeListParams): Promise<StripePage<StripeDispute>>;
   };
 }
 
@@ -280,6 +299,39 @@ async function checkFatalJobs(deps: ReconcileDeps, now: number): Promise<string[
   );
 }
 
+/** Yesterday in UTC, as `[start, end)` epoch milliseconds. */
+function yesterdayWindow(now: number): { start: number; end: number } {
+  const at = new Date(now);
+  const end = Date.UTC(at.getUTCFullYear(), at.getUTCMonth(), at.getUTCDate());
+  return { start: end - DAY_MS, end };
+}
+
+/**
+ * Walks every page of a Stripe list within a window. Stripe caps a page at
+ * 100, and a busy day is more than that -- reading only the first page would
+ * make the daily totals quietly wrong in exactly the direction (Stripe looks
+ * smaller than the ledger) that reads as a missing charge.
+ */
+async function listAllInWindow<T extends { id: string }>(
+  list: (params: StripeListParams) => Promise<StripePage<T>>,
+  window: { start: number; end: number },
+): Promise<T[]> {
+  const all: T[] = [];
+  let startingAfter: string | undefined;
+  for (;;) {
+    const page = await list({
+      created: { gte: Math.floor(window.start / 1000), lt: Math.floor(window.end / 1000) },
+      limit: 100,
+      ...(startingAfter ? { starting_after: startingAfter } : {}),
+    });
+    all.push(...page.data);
+    const last = page.data.at(-1);
+    if (!page.has_more || !last) break;
+    startingAfter = last.id;
+  }
+  return all;
+}
+
 /**
  * (d) Yesterday's money, both sides.
  *
@@ -295,37 +347,29 @@ async function checkFatalJobs(deps: ReconcileDeps, now: number): Promise<string[
  * this a "look at the day" signal rather than a ledger equality.
  */
 async function checkStripeDay(deps: ReconcileDeps, now: number): Promise<string[]> {
-  const todayStart = Date.UTC(
-    new Date(now).getUTCFullYear(),
-    new Date(now).getUTCMonth(),
-    new Date(now).getUTCDate(),
-  );
-  const dayStart = todayStart - DAY_MS;
+  const window = yesterdayWindow(now);
+  const charges = await listAllInWindow((params) => deps.stripe.charges.list(params), window);
 
   let stripeCount = 0;
   let stripeCents = 0n;
-  let startingAfter: string | undefined;
-  for (;;) {
-    const page = await deps.stripe.charges.list({
-      created: { gte: Math.floor(dayStart / 1000), lt: Math.floor(todayStart / 1000) },
-      limit: 100,
-      ...(startingAfter ? { starting_after: startingAfter } : {}),
-    });
-    for (const charge of page.data) {
-      if (charge.status !== "succeeded" || charge.amount <= 0) continue;
-      stripeCount += 1;
-      stripeCents += BigInt(charge.amount);
-    }
-    const last = page.data.at(-1);
-    if (!page.has_more || !last) break;
-    startingAfter = last.id;
+  for (const charge of charges) {
+    if (charge.status !== "succeeded" || charge.amount <= 0) continue;
+    stripeCount += 1;
+    stripeCents += BigInt(charge.amount);
   }
 
+  // `stripe_payment_intent IS NOT NULL` is the "was actually charged" marker:
+  // it is written by `checkout.session.completed` and nowhere else, so it is
+  // set for exactly the payments Stripe took money for. Selecting on state
+  // alone would count abandoned checkouts that this very run canceled -- rows
+  // that left `created` without a charge behind them -- and report a
+  // discrepancy for every one of them.
   const { rows } = await deps.pool.query<{ n: string; total: string | null }>(
     `SELECT count(*) AS n, sum(amount_usd_cents + premium_usd_cents) AS total
        FROM payments
-      WHERE state <> 'created' AND created_at >= $1 AND created_at < $2`,
-    [new Date(dayStart), new Date(todayStart)],
+      WHERE state <> 'created' AND stripe_payment_intent IS NOT NULL
+        AND created_at >= $1 AND created_at < $2`,
+    [new Date(window.start), new Date(window.end)],
   );
   const ledgerCount = Number(rows[0]?.n ?? "0");
   const ledgerCents = BigInt(rows[0]?.total ?? "0");
@@ -333,8 +377,54 @@ async function checkStripeDay(deps: ReconcileDeps, now: number): Promise<string[
   if (stripeCount === ledgerCount && stripeCents === ledgerCents) return [];
 
   return [
-    `Stripe cross-check for ${utcDay(new Date(dayStart))}: Stripe has ${stripeCount} succeeded charges totalling ${stripeCents} cents, the ledger has ${ledgerCount} paid payments totalling ${ledgerCents} cents`,
+    `Stripe cross-check for ${utcDay(new Date(window.start))}: Stripe has ${stripeCount} succeeded charges totalling ${stripeCents} cents, the ledger has ${ledgerCount} charged payments totalling ${ledgerCents} cents`,
   ];
+}
+
+/**
+ * (e) Yesterday's chargebacks, against what the state machine did about them.
+ *
+ * The webhook's dispute router handles every state it safely can, but it
+ * deliberately leaves one alone: a payment in `paying` is mid-send and owned
+ * by the payer worker, so transitioning it there would race an on-chain
+ * transaction. That payment goes on to become `held` -- disputed, but with the
+ * tokens escrowed and the keeper scheduled to deliver them to someone who has
+ * already taken their money back. `src/stripe/webhook.ts` names this check as
+ * the thing that catches it, so this is that check.
+ *
+ * It never auto-forfeits. By the time this runs the tokens may be delivered,
+ * the dispute may have been won, or the escrow entry may be gone -- and
+ * clawing back a payer's tokens on a day-old inference is not a decision to
+ * automate. The line tells an operator which payment to look at.
+ */
+async function checkDisputes(deps: ReconcileDeps, now: number): Promise<string[]> {
+  const window = yesterdayWindow(now);
+  const disputes = await listAllInWindow((params) => deps.stripe.disputes.list(params), window);
+
+  const lines: string[] = [];
+  for (const dispute of disputes) {
+    const intentId =
+      typeof dispute.payment_intent === "string"
+        ? dispute.payment_intent
+        : dispute.payment_intent?.id;
+    if (!intentId) continue;
+
+    const { rows } = await deps.pool.query<{ id: string; state: PaymentState }>(
+      "SELECT id, state FROM payments WHERE stripe_payment_intent = $1",
+      [intentId],
+    );
+    const payment = rows[0];
+    // A dispute on a charge this service never made is another integration's.
+    if (!payment) continue;
+
+    if (payment.state === "forfeited" || payment.state === "canceled") continue;
+
+    lines.push(
+      `payment ${payment.id}: disputed (${dispute.id}) but still '${payment.state}' -- the dispute did not resolve to 'forfeited' or 'canceled', so the tokens need a manual decision`,
+    );
+  }
+
+  return lines;
 }
 
 /**
@@ -361,6 +451,7 @@ export async function handleReconcile(deps: ReconcileDeps, _job: JobRow): Promis
     ...(await runCheck("stuck rows", () => checkStuckRows(deps, now))),
     ...(await runCheck("fatal jobs", () => checkFatalJobs(deps, now))),
     ...(await runCheck("stripe day", () => checkStripeDay(deps, now))),
+    ...(await runCheck("disputes", () => checkDisputes(deps, now))),
   ];
 
   if (lines.length === 0) {

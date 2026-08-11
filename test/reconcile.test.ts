@@ -13,6 +13,7 @@ import {
   type ReconcileDeps,
   type ReconcileStripe,
   type StripeCharge,
+  type StripeDispute,
 } from "../src/worker/reconcile.js";
 import { handlers } from "../src/worker/index.js";
 
@@ -61,7 +62,9 @@ class FakeEscrow implements ReconcileChain {
 
 class FakeStripe implements ReconcileStripe {
   charges: ReconcileStripe["charges"];
+  disputes: ReconcileStripe["disputes"];
   pages: StripeCharge[][] = [[]];
+  disputeRows: StripeDispute[] = [];
 
   constructor() {
     this.charges = {
@@ -72,6 +75,9 @@ class FakeStripe implements ReconcileStripe {
         const data = this.pages[index] ?? [];
         return { data, has_more: index < this.pages.length - 1 };
       },
+    };
+    this.disputes = {
+      list: async () => ({ data: this.disputeRows, has_more: false }),
     };
   }
 }
@@ -117,6 +123,12 @@ interface SeedOptions {
   unlockAt?: Date | null;
   createdAt?: Date;
   updatedAt?: Date;
+  /**
+   * Defaults to a unique id for any payment past 'created', and to null for a
+   * payment still in it -- mirroring the webhook, which writes the intent in
+   * the same transition that takes a payment out of 'created'.
+   */
+  stripePaymentIntent?: string | null;
 }
 
 async function seedPayment(options: SeedOptions): Promise<string> {
@@ -128,9 +140,10 @@ async function seedPayment(options: SeedOptions): Promise<string> {
     premiumUsdCents: options.premiumUsdCents ?? 0n,
     claimAddress: options.claimAddress ?? BENEFICIARY,
   });
+  const defaultIntent = options.state === "created" ? null : `pi_${payment.id}`;
   await pool.query(
     `UPDATE payments SET state = $2, tokens_held = $3, release_tx = $4, unlock_at = $5,
-       created_at = $6, updated_at = $7
+       created_at = $6, updated_at = $7, stripe_payment_intent = $8
      WHERE id = $1`,
     [
       payment.id,
@@ -140,6 +153,9 @@ async function seedPayment(options: SeedOptions): Promise<string> {
       options.unlockAt === undefined ? new Date(NOW.getTime() + 30 * 24 * HOUR_MS) : options.unlockAt,
       options.createdAt ?? NOW,
       options.updatedAt ?? NOW,
+      options.stripePaymentIntent === undefined
+        ? defaultIntent
+        : options.stripePaymentIntent,
     ],
   );
   return payment.id;
@@ -424,8 +440,83 @@ describe("handleReconcile", () => {
     expect(resend.sent).toHaveLength(0);
   });
 
+  it("does not count a checkout it just canceled against Stripe's charges", async () => {
+    // Abandoned yesterday, never charged, and canceled by this very run: it
+    // leaves 'created' mid-scan, and must not then look like a missing charge.
+    const abandoned = await seedPayment({
+      state: "created",
+      amountUsdCents: 7_000n,
+      createdAt: new Date("2026-08-10T09:00:00Z"),
+      updatedAt: new Date("2026-08-10T09:00:00Z"),
+    });
+    await seedPayment({
+      state: "paid",
+      amountUsdCents: 2_500n,
+      createdAt: new Date("2026-08-10T11:00:00Z"),
+      updatedAt: new Date("2026-08-10T11:05:00Z"),
+    });
+    stripe.pages = [[{ id: "ch_1", amount: 2_500, status: "succeeded" }]];
+
+    await handleReconcile(deps(), RECONCILE_JOB);
+
+    // The cancellation is still reported -- it just isn't a Stripe mismatch.
+    expect(alertText()).toContain(abandoned);
+    expect(alertText()).not.toMatch(/stripe cross-check/i);
+  });
+
   it("ignores charges that did not succeed", async () => {
     stripe.pages = [[{ id: "ch_1", amount: 5_000, status: "failed" }]];
+
+    await handleReconcile(deps(), RECONCILE_JOB);
+
+    expect(resend.sent).toHaveLength(0);
+  });
+
+  it("flags a disputed payment the state machine never retired", async () => {
+    // The webhook leaves a dispute-during-'paying' alone rather than racing the
+    // payer worker, so the payment goes on to 'held' with a chargeback against
+    // it. This check is what the webhook defers to.
+    const id = await seedPayment({ state: "held" });
+    escrow.seed(paymentIdBytes32(id));
+    stripe.disputeRows = [{ id: "dp_1", payment_intent: `pi_${id}` }];
+
+    await handleReconcile(deps(), RECONCILE_JOB);
+
+    expect(alertText()).toContain(id);
+    expect(alertText()).toContain("dp_1");
+    expect(alertText()).toMatch(/disputed/i);
+  });
+
+  it("says nothing when the dispute was already forfeited", async () => {
+    const id = await seedPayment({ state: "forfeited" });
+    stripe.disputeRows = [{ id: "dp_1", payment_intent: `pi_${id}` }];
+
+    await handleReconcile(deps(), RECONCILE_JOB);
+
+    expect(resend.sent).toHaveLength(0);
+  });
+
+  it("says nothing when the dispute cancelled the payment before it was paid", async () => {
+    const id = await seedPayment({ state: "canceled" });
+    stripe.disputeRows = [{ id: "dp_1", payment_intent: `pi_${id}` }];
+
+    await handleReconcile(deps(), RECONCILE_JOB);
+
+    expect(resend.sent).toHaveLength(0);
+  });
+
+  it("resolves an expanded payment intent on a dispute", async () => {
+    const id = await seedPayment({ state: "claimed", releaseTx: `0x${"b".repeat(64)}` });
+    escrow.seed(paymentIdBytes32(id), { settled: true });
+    stripe.disputeRows = [{ id: "dp_2", payment_intent: { id: `pi_${id}` } }];
+
+    await handleReconcile(deps(), RECONCILE_JOB);
+
+    expect(alertText()).toContain("dp_2");
+  });
+
+  it("ignores a dispute on a charge this service never made", async () => {
+    stripe.disputeRows = [{ id: "dp_9", payment_intent: "pi_someone_else" }];
 
     await handleReconcile(deps(), RECONCILE_JOB);
 
