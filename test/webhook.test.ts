@@ -312,7 +312,7 @@ describe("handleStripeEvent -- checkout.session.completed", () => {
     );
   });
 
-  it("uses BANK_HOLD_DAYS for a us_bank_account payment", async () => {
+  it("uses BANK_HOLD_DAYS for a us_bank_account payment and does NOT schedule the pay yet", async () => {
     const payment = await newPayment("bank@example.com");
     const stub = new PaymentIntentStub();
     stub.intent = paymentIntent(
@@ -322,14 +322,50 @@ describe("handleStripeEvent -- checkout.session.completed", () => {
 
     await handleStripeEvent(
       deps(stub),
-      signedEvent("checkout.session.completed", completedSession(payment.id)),
+      // A bank debit is only *submitted* at `completed`: payment_status is
+      // 'unpaid' and the ACH can still fail days later.
+      signedEvent(
+        "checkout.session.completed",
+        completedSession(payment.id, {
+          payment_status: "unpaid",
+          payment_method_types: ["us_bank_account"],
+        }),
+      ),
     );
 
     const row = await readPayment(payment.id);
+    expect(row.state).toBe("paid");
     expect(row.method).toBe("bank");
     const unlockAt = new Date(row.unlock_at as unknown as string).getTime();
     expect(unlockAt).toBeGreaterThan(Date.now() + 6 * DAY_MS);
     expect(unlockAt).toBeLessThan(Date.now() + 8 * DAY_MS);
+
+    // Paying here would send USDC on-chain for money that may never arrive.
+    expect(await readJobs(`pay:${payment.id}`)).toHaveLength(0);
+  });
+
+  it("consumes a completed event for a payment that has already left 'created'", async () => {
+    const payment = await newPayment("poison@example.com", { state: "held" });
+    const stub = new PaymentIntentStub();
+    stub.intent = paymentIntent("card", Math.floor(Date.now() / 1000) + 86400);
+
+    // No throw: retrying would fail identically forever, so the event is
+    // logged and consumed instead of becoming a poison pill.
+    await expect(
+      handleStripeEvent(
+        deps(stub),
+        signedEvent(
+          "checkout.session.completed",
+          completedSession(payment.id),
+          "evt_poison",
+        ),
+      ),
+    ).resolves.toBeUndefined();
+
+    const { rows } = await pool.query("SELECT id FROM stripe_events");
+    expect(rows).toHaveLength(1);
+    expect((await readPayment(payment.id)).state).toBe("held");
+    expect(await readJobs(`pay:${payment.id}`)).toHaveLength(0);
   });
 
   it("schedules an instant payment immediately, ignoring available_on", async () => {
@@ -385,6 +421,116 @@ describe("handleStripeEvent -- checkout.session.completed", () => {
   });
 });
 
+describe("handleStripeEvent -- async bank debits", () => {
+  it("schedules the pay at available_on once the debit clears", async () => {
+    const payment = await newPayment("ach-ok@example.com");
+    const availableOn = Math.floor(Date.now() / 1000) + 2 * 86400;
+    const stub = new PaymentIntentStub();
+    stub.intent = paymentIntent("us_bank_account", availableOn);
+
+    await handleStripeEvent(
+      deps(stub),
+      signedEvent(
+        "checkout.session.completed",
+        completedSession(payment.id, { payment_status: "unpaid" }),
+      ),
+    );
+    expect(await readJobs(`pay:${payment.id}`)).toHaveLength(0);
+
+    await handleStripeEvent(
+      deps(stub),
+      signedEvent(
+        "checkout.session.async_payment_succeeded",
+        completedSession(payment.id, { payment_status: "paid" }),
+      ),
+    );
+
+    const jobs = await readJobs(`pay:${payment.id}`);
+    expect(jobs).toHaveLength(1);
+    expect(jobs[0]?.kind).toBe("pay");
+    expect(new Date(jobs[0]?.run_at as unknown as string).getTime()).toBe(
+      availableOn * 1000,
+    );
+    expect((await readPayment(payment.id)).state).toBe("paid");
+  });
+
+  it("schedules an instant payment immediately when its debit clears", async () => {
+    const payment = await newPayment("ach-instant@example.com", { instant: true });
+    const stub = new PaymentIntentStub();
+    stub.intent = paymentIntent(
+      "us_bank_account",
+      Math.floor(Date.now() / 1000) + 2 * 86400,
+    );
+
+    await handleStripeEvent(
+      deps(stub),
+      signedEvent(
+        "checkout.session.completed",
+        completedSession(payment.id, { payment_status: "unpaid" }),
+      ),
+    );
+    await handleStripeEvent(
+      deps(stub),
+      signedEvent(
+        "checkout.session.async_payment_succeeded",
+        completedSession(payment.id, { payment_status: "paid" }),
+      ),
+    );
+
+    const jobs = await readJobs(`pay:${payment.id}`);
+    expect(jobs).toHaveLength(1);
+    const runAt = new Date(jobs[0]?.run_at as unknown as string).getTime();
+    expect(runAt).toBeLessThan(Date.now() + 60_000);
+  });
+
+  it("cancels the payment when the debit fails", async () => {
+    const payment = await newPayment("ach-fail@example.com");
+    const stub = new PaymentIntentStub();
+    stub.intent = paymentIntent(
+      "us_bank_account",
+      Math.floor(Date.now() / 1000) + 2 * 86400,
+    );
+
+    await handleStripeEvent(
+      deps(stub),
+      signedEvent(
+        "checkout.session.completed",
+        completedSession(payment.id, { payment_status: "unpaid" }),
+      ),
+    );
+    await handleStripeEvent(
+      deps(stub),
+      signedEvent(
+        "checkout.session.async_payment_failed",
+        completedSession(payment.id, { payment_status: "unpaid" }),
+      ),
+    );
+
+    expect((await readPayment(payment.id)).state).toBe("canceled");
+    expect(await readJobs(`pay:${payment.id}`)).toHaveLength(0);
+  });
+
+  it("does not schedule a pay for a payment that a dispute already canceled", async () => {
+    const payment = await newPayment("ach-late@example.com", {
+      state: "canceled",
+      paymentIntent: "pi_test_1",
+    });
+    const stub = new PaymentIntentStub();
+    stub.intent = paymentIntent("us_bank_account", Math.floor(Date.now() / 1000));
+
+    await handleStripeEvent(
+      deps(stub),
+      signedEvent(
+        "checkout.session.async_payment_succeeded",
+        completedSession(payment.id, { payment_status: "paid" }),
+      ),
+    );
+
+    expect(await readJobs(`pay:${payment.id}`)).toHaveLength(0);
+    expect((await readPayment(payment.id)).state).toBe("canceled");
+  });
+});
+
 describe("handleStripeEvent -- charge.dispute.created", () => {
   it("cancels a payment that has not been paid on-chain yet", async () => {
     const payment = await newPayment("disputed@example.com", {
@@ -404,6 +550,25 @@ describe("handleStripeEvent -- charge.dispute.created", () => {
 
     expect((await readPayment(payment.id)).state).toBe("canceled");
     expect(await readJobs(`forfeit:${payment.id}`)).toHaveLength(0);
+  });
+
+  it("cancels a payment in 'settled' -- still pre-on-chain-pay", async () => {
+    const payment = await newPayment("settled-dispute@example.com", {
+      state: "settled",
+      paymentIntent: "pi_dispute_settled",
+    });
+
+    await handleStripeEvent(
+      deps(),
+      signedEvent("charge.dispute.created", {
+        id: "dp_s",
+        object: "dispute",
+        charge: "ch_s",
+        payment_intent: "pi_dispute_settled",
+      }),
+    );
+
+    expect((await readPayment(payment.id)).state).toBe("canceled");
   });
 
   it("forfeits a held payment and enqueues the on-chain forfeit", async () => {
@@ -480,6 +645,29 @@ describe("handleStripeEvent -- charge.refunded", () => {
       }),
     );
 
+    expect((await readPayment(payment.id)).state).toBe("refunded");
+  });
+
+  it("treats a partial refund as a full refund (known limitation, asserted deliberately)", async () => {
+    const payment = await newPayment("partial@example.com", {
+      state: "paid",
+      paymentIntent: "pi_refund_partial",
+    });
+
+    await handleStripeEvent(
+      deps(),
+      signedEvent("charge.refunded", {
+        id: "ch_rp",
+        object: "charge",
+        payment_intent: "pi_refund_partial",
+        refunded: false,
+        amount: 5000,
+        amount_refunded: 1000,
+      }),
+    );
+
+    // The service only ever issues full refunds today. If partials become
+    // possible, gate this on `amount_refunded === amount`.
     expect((await readPayment(payment.id)).state).toBe("refunded");
   });
 

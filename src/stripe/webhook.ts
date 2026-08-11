@@ -7,6 +7,7 @@ import {
   type PaymentState,
   type Queryable,
 } from "../db/payments.js";
+import { envBigInt } from "../env.js";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -50,15 +51,6 @@ export interface StripeWebhookVerifier {
 export interface WebhookDeps {
   pool: Pool;
   stripe: StripePaymentIntentReader;
-}
-
-function envBigInt(name: string, fallback: bigint): bigint {
-  const raw = process.env[name];
-  if (raw === undefined || raw === "") return fallback;
-  if (!/^\d+$/.test(raw)) {
-    throw new Error(`${name} must be a non-negative integer, got: ${raw}`);
-  }
-  return BigInt(raw);
 }
 
 /**
@@ -110,15 +102,78 @@ function methodFromCharge(charge: Stripe.Charge | null): "card" | "bank" {
   return charge?.payment_method_details?.type === "us_bank_account" ? "bank" : "card";
 }
 
+interface PaymentSummary {
+  id: string;
+  state: PaymentState;
+  instant: boolean;
+  stripe_payment_intent: string | null;
+}
+
+const PAYMENT_SUMMARY_COLUMNS = "id, state, instant, stripe_payment_intent";
+
 async function findPaymentByIntent(
   pool: Queryable,
   paymentIntentId: string,
-): Promise<{ id: string; state: PaymentState } | null> {
-  const { rows } = await pool.query<{ id: string; state: PaymentState }>(
-    "SELECT id, state FROM payments WHERE stripe_payment_intent = $1",
+): Promise<PaymentSummary | null> {
+  const { rows } = await pool.query<PaymentSummary>(
+    `SELECT ${PAYMENT_SUMMARY_COLUMNS} FROM payments WHERE stripe_payment_intent = $1`,
     [paymentIntentId],
   );
   return rows[0] ?? null;
+}
+
+async function findPaymentById(
+  pool: Queryable,
+  paymentId: string,
+): Promise<PaymentSummary | null> {
+  const { rows } = await pool.query<PaymentSummary>(
+    `SELECT ${PAYMENT_SUMMARY_COLUMNS} FROM payments WHERE id = $1`,
+    [paymentId],
+  );
+  return rows[0] ?? null;
+}
+
+/** Retrieves the charge behind a PaymentIntent with its balance transaction expanded. */
+async function retrieveCharge(
+  deps: WebhookDeps,
+  paymentIntentId: string,
+): Promise<Stripe.Charge | null> {
+  const intent = await deps.stripe.paymentIntents.retrieve(paymentIntentId, {
+    expand: ["latest_charge.balance_transaction"],
+  });
+  return expanded(intent.latest_charge);
+}
+
+/**
+ * Queues the on-chain pay.
+ *
+ * Instant runs now -- the pool fronts the USDC, so there's nothing to wait
+ * for. Everything else waits for Stripe's money to actually land, which the
+ * balance transaction states exactly (`available_on`); without one we guess
+ * three days rather than paying out of funds we don't have.
+ *
+ * The `pay:<id>` dedupe key makes this safe to call from more than one event
+ * (a `completed` and a later `async_payment_succeeded` for the same payment
+ * schedule one job, not two).
+ */
+async function schedulePay(
+  db: Queryable,
+  paymentId: string,
+  instant: boolean,
+  charge: Stripe.Charge | null,
+): Promise<void> {
+  const payload: PayJobPayload = { paymentId };
+  if (instant) {
+    await enqueue(db, "pay", payload, { dedupeKey: `pay:${paymentId}` });
+    return;
+  }
+
+  const availableOn = expanded(charge?.balance_transaction)?.available_on;
+  const runAt =
+    typeof availableOn === "number"
+      ? new Date(availableOn * 1000)
+      : new Date(Date.now() + SETTLEMENT_FALLBACK_DAYS * DAY_MS);
+  await enqueue(db, "pay", payload, { runAt, dedupeKey: `pay:${paymentId}` });
 }
 
 async function handleSessionCompleted(
@@ -141,12 +196,7 @@ async function handleSessionCompleted(
     );
   }
 
-  // One retrieve gets both facts we need: which rail funded the charge, and
-  // when Stripe's money becomes available (the default path's pay schedule).
-  const intent = await deps.stripe.paymentIntents.retrieve(paymentIntentId, {
-    expand: ["latest_charge.balance_transaction"],
-  });
-  const charge = expanded(intent.latest_charge);
+  const charge = await retrieveCharge(deps, paymentIntentId);
   const method = methodFromCharge(charge);
 
   const paid = await transition(db, paymentId, ["created"], "paid", {
@@ -155,24 +205,47 @@ async function handleSessionCompleted(
     unlock_at: unlockAtFor(method, Date.now()),
   });
 
-  const payload: PayJobPayload = { paymentId };
+  // For a bank debit, `completed` fires when the payer *submits* the debit,
+  // not when it clears -- `payment_status` is still 'unpaid' and the ACH can
+  // fail days later. Scheduling the pay here would send USDC on-chain for
+  // money that never arrives, so the async rails wait for
+  // `async_payment_succeeded` instead.
+  if (session.payment_status !== "paid") return;
 
-  if (paid.instant) {
-    // Instant: the pool fronts the USDC now, so pay immediately rather than
-    // waiting for Stripe to settle.
-    await enqueue(db, "pay", payload, { dedupeKey: `pay:${paymentId}` });
-    return;
-  }
+  await schedulePay(db, paymentId, paid.instant, charge);
+}
 
-  // Default path: pay when Stripe's money actually lands, not when the payer
-  // checks out. `available_on` is that date straight from the ledger.
-  const availableOn = expanded(charge?.balance_transaction)?.available_on;
-  const runAt =
-    typeof availableOn === "number"
-      ? new Date(availableOn * 1000)
-      : new Date(Date.now() + SETTLEMENT_FALLBACK_DAYS * DAY_MS);
+/** The bank debit cleared: now, and only now, is the pay safe to schedule. */
+async function handleAsyncPaymentSucceeded(
+  deps: WebhookDeps,
+  db: Queryable,
+  session: Stripe.Checkout.Session,
+): Promise<void> {
+  const paymentId = session.metadata?.payment_id;
+  if (!paymentId) return;
 
-  await enqueue(db, "pay", payload, { runAt, dedupeKey: `pay:${paymentId}` });
+  const payment = await findPaymentById(db, paymentId);
+  if (!payment) return;
+
+  // Anything other than 'paid' means the payment has already moved on --
+  // canceled by a dispute, refunded, or already scheduled and progressing.
+  // Re-scheduling from here would resurrect work the state machine retired.
+  if (payment.state !== "paid") return;
+
+  const paymentIntentId = refId(session.payment_intent) ?? payment.stripe_payment_intent;
+  const charge = paymentIntentId ? await retrieveCharge(deps, paymentIntentId) : null;
+
+  await schedulePay(db, paymentId, payment.instant, charge);
+}
+
+/** The bank debit failed. No money arrived, so nothing may be paid on-chain. */
+async function handleAsyncPaymentFailed(
+  db: Queryable,
+  session: Stripe.Checkout.Session,
+): Promise<void> {
+  const paymentId = session.metadata?.payment_id;
+  if (!paymentId) return;
+  await transition(db, paymentId, ["paid"], "canceled");
 }
 
 async function handleDisputeCreated(
@@ -223,6 +296,33 @@ async function handleChargeRefunded(db: Queryable, charge: Stripe.Charge): Promi
   }
 }
 
+async function route(
+  deps: WebhookDeps,
+  db: Queryable,
+  event: Stripe.Event,
+): Promise<void> {
+  switch (event.type) {
+    case "checkout.session.completed":
+      await handleSessionCompleted(deps, db, event.data.object);
+      break;
+    case "checkout.session.async_payment_succeeded":
+      await handleAsyncPaymentSucceeded(deps, db, event.data.object);
+      break;
+    case "checkout.session.async_payment_failed":
+      await handleAsyncPaymentFailed(db, event.data.object);
+      break;
+    case "charge.dispute.created":
+      await handleDisputeCreated(db, event.data.object);
+      break;
+    case "charge.refunded":
+      await handleChargeRefunded(db, event.data.object);
+      break;
+    default:
+      // Unsubscribed event types are recorded and ignored.
+      break;
+  }
+}
+
 /**
  * Routes one verified Stripe event, exactly once.
  *
@@ -231,12 +331,22 @@ async function handleChargeRefunded(db: Queryable, charge: Stripe.Charge): Promi
  * without doing anything, and a failed delivery rolls the id back out so
  * Stripe's retry gets a real second attempt. Doing the insert on autocommit
  * instead would burn the id on any downstream failure and strand the payment.
+ *
+ * `TransitionError` is the one exception to rolling back. It means the
+ * payment isn't in a state this event can act on -- a fact that will still be
+ * true on every retry -- so the event is logged and consumed rather than
+ * redelivered forever as a poison pill. (A no-match UPDATE isn't a SQL error,
+ * so the transaction is still committable at that point.)
  */
 export async function handleStripeEvent(
   deps: WebhookDeps,
   event: Stripe.Event,
 ): Promise<void> {
   const client = await deps.pool.connect();
+  // Set only if ROLLBACK itself fails, i.e. the connection is no longer
+  // trustworthy and must be destroyed instead of returned to the pool.
+  let suspect: Error | undefined;
+
   try {
     await client.query("BEGIN");
 
@@ -249,26 +359,25 @@ export async function handleStripeEvent(
       return;
     }
 
-    switch (event.type) {
-      case "checkout.session.completed":
-        await handleSessionCompleted(deps, client, event.data.object);
-        break;
-      case "charge.dispute.created":
-        await handleDisputeCreated(client, event.data.object);
-        break;
-      case "charge.refunded":
-        await handleChargeRefunded(client, event.data.object);
-        break;
-      default:
-        // Unsubscribed event types are recorded and ignored.
-        break;
+    try {
+      await route(deps, client, event);
+    } catch (err) {
+      if (!(err instanceof TransitionError)) throw err;
+      console.warn(
+        `stripe event ${event.id} (${event.type}): ${err.message} -- consuming, not retrying`,
+      );
     }
 
     await client.query("COMMIT");
   } catch (err) {
-    await client.query("ROLLBACK");
+    try {
+      await client.query("ROLLBACK");
+    } catch (rollbackErr) {
+      suspect =
+        rollbackErr instanceof Error ? rollbackErr : new Error(String(rollbackErr));
+    }
     throw err;
   } finally {
-    client.release();
+    client.release(suspect);
   }
 }

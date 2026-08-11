@@ -25,12 +25,16 @@ let pool: Pool;
 class StripeStub {
   calls: Stripe.Checkout.SessionCreateParams[] = [];
   nextUrl = "https://checkout.stripe.com/c/pay/cs_test_1";
-  nextId = "cs_test_1";
+  /** Session ids are unique in `payments`, so each call gets its own. */
+  nextId: string | null = null;
   checkout = {
     sessions: {
       create: async (params: Stripe.Checkout.SessionCreateParams) => {
         this.calls.push(params);
-        return { id: this.nextId, url: this.nextUrl };
+        return {
+          id: this.nextId ?? `cs_test_${this.calls.length}`,
+          url: this.nextUrl,
+        };
       },
     },
   };
@@ -184,6 +188,25 @@ describe("createCheckoutSession -- rejections", () => {
         walletAddress: "0xnot-an-address",
       }),
     ).rejects.toMatchObject({ code: "invalid_wallet_address" });
+  });
+
+  it("leaves no orphan payment row when BASE_URL is missing", async () => {
+    delete process.env.BASE_URL;
+    const d = deps();
+    await expect(
+      createCheckoutSession(d, {
+        projectId: PROJECT_ID,
+        amountUsdCents: 5000n,
+        email: "noenv@example.com",
+        instant: false,
+      }),
+    ).rejects.toThrow(/BASE_URL/);
+
+    // Every throw site sits before the insert, so a rejected request leaves
+    // nothing behind for reconciliation to puzzle over.
+    const { rows } = await pool.query("SELECT * FROM payments");
+    expect(rows).toHaveLength(0);
+    expect(d.stripe.calls).toHaveLength(0);
   });
 
   it("rejects a non-positive amount", async () => {
@@ -414,6 +437,49 @@ describe("createCheckoutSession -- happy path", () => {
     // The premium is a service fee -- the donation quoted (and later paid
     // on-chain) is still the donation amount.
     expect((quote.calls[0] as readonly unknown[])[2]).toBe(50_000_000n);
+  });
+
+  it("persists the premium so reconciliation never re-derives it from PREMIUM_BPS", async () => {
+    const d = deps();
+    const instantResult = await createCheckoutSession(d, {
+      projectId: PROJECT_ID,
+      amountUsdCents: 5000n,
+      email: "stored-premium@example.com",
+      instant: true,
+    });
+    const defaultResult = await createCheckoutSession(d, {
+      projectId: PROJECT_ID,
+      amountUsdCents: 5000n,
+      email: "stored-nopremium@example.com",
+      instant: false,
+    });
+
+    const { rows } = await pool.query<{ id: string; premium_usd_cents: string }>(
+      "SELECT id, premium_usd_cents FROM payments WHERE id = ANY($1)",
+      [[instantResult.paymentId, defaultResult.paymentId]],
+    );
+    const byId = new Map(rows.map((row) => [row.id, row.premium_usd_cents]));
+    expect(byId.get(instantResult.paymentId)).toBe("75");
+    expect(byId.get(defaultResult.paymentId)).toBe("0");
+  });
+
+  it("does not store a session id for a session Stripe returned without a URL", async () => {
+    const d = deps();
+    d.stripe.nextUrl = null as unknown as string;
+
+    await expect(
+      createCheckoutSession(d, {
+        projectId: PROJECT_ID,
+        amountUsdCents: 5000n,
+        email: "nourl@example.com",
+        instant: false,
+      }),
+    ).rejects.toMatchObject({ code: "stripe_session_missing_url" });
+
+    const { rows } = await pool.query<{ stripe_session_id: string | null }>(
+      "SELECT stripe_session_id FROM payments WHERE email = 'nourl@example.com'",
+    );
+    expect(rows[0]?.stripe_session_id).toBeNull();
   });
 
   it("rounds the premium down (integer cents, never float math)", async () => {

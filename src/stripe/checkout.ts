@@ -4,6 +4,7 @@ import { erc20Abi } from "../chain/abi/erc20.js";
 import { publicClient } from "../chain/client.js";
 import { quoteTokens, USDC_ON_BASE, type ReadContractClient } from "../chain/quote.js";
 import { createPayment, type Queryable } from "../db/payments.js";
+import { envBigInt } from "../env.js";
 import type { WalletProvider } from "../wallets/types.js";
 
 /** USDC has 6 decimals; a US cent is 10^4 of its base units. */
@@ -91,21 +92,6 @@ function requireEnv(name: string): string {
     throw new Error(`${name} environment variable is not set`);
   }
   return value;
-}
-
-/**
- * Reads a non-negative integer from the environment, falling back to
- * `fallback` when unset/empty. Rejects anything that isn't a plain integer
- * so a typo'd ceiling can never silently become `NaN` (which compares false
- * against everything and would disable the check).
- */
-function envBigInt(name: string, fallback: bigint): bigint {
-  const raw = process.env[name];
-  if (raw === undefined || raw === "") return fallback;
-  if (!/^\d+$/.test(raw)) {
-    throw new Error(`${name} must be a non-negative integer, got: ${raw}`);
-  }
-  return BigInt(raw);
 }
 
 function envAddress(name: string): Address {
@@ -264,18 +250,23 @@ export async function createCheckoutSession(
   const premiumCents = instant
     ? (amountUsdCents * envBigInt("PREMIUM_BPS", DEFAULT_PREMIUM_BPS)) / BPS_DENOMINATOR
     : 0n;
-  const chargeCents = amountUsdCents + premiumCents;
+
+  // Both of these can throw, so both happen before the insert -- nothing
+  // between `createPayment` and the Stripe call may fail, or we'd orphan a
+  // row that no session will ever reference.
+  const unitAmount = centsToStripeAmount(amountUsdCents + premiumCents);
+  const baseUrl = requireEnv("BASE_URL").replace(/\/+$/, "");
 
   const payment = await createPayment(pool, {
     projectId,
     email,
     amountUsdCents,
+    premiumUsdCents: premiumCents,
     instant,
     claimAddress,
     quoteTokens: quotedTokens,
   });
 
-  const baseUrl = requireEnv("BASE_URL").replace(/\/+$/, "");
   const session = await stripe.checkout.sessions.create({
     mode: "payment",
     payment_method_types: paymentMethodTypes,
@@ -291,7 +282,7 @@ export async function createCheckoutSession(
         quantity: 1,
         price_data: {
           currency: "usd",
-          unit_amount: centsToStripeAmount(chargeCents),
+          unit_amount: unitAmount,
           product_data: {
             name: instant ? `${project.name} (instant)` : project.name,
           },
@@ -303,17 +294,20 @@ export async function createCheckoutSession(
     cancel_url: `${baseUrl}/checkout/cancel?payment_id=${payment.id}`,
   });
 
-  await pool.query("UPDATE payments SET stripe_session_id = $2, updated_at = now() WHERE id = $1", [
-    payment.id,
-    session.id,
-  ]);
-
+  // Validate before persisting: a session with no redirect URL is one the
+  // payer can never reach, so recording its id would only make the dead
+  // session look live to reconciliation.
   if (!session.url) {
     throw new CheckoutError(
       "stripe_session_missing_url",
       `Stripe session ${session.id} has no redirect URL`,
     );
   }
+
+  await pool.query("UPDATE payments SET stripe_session_id = $2, updated_at = now() WHERE id = $1", [
+    payment.id,
+    session.id,
+  ]);
 
   return { url: session.url, paymentId: payment.id };
 }

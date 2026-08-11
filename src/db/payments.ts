@@ -26,6 +26,7 @@ export interface PaymentRow {
   project_id: string;
   email: string;
   amount_usd_cents: string;
+  premium_usd_cents: string;
   instant: boolean;
   method: "card" | "bank" | null;
   state: PaymentState;
@@ -46,6 +47,12 @@ export interface CreatePaymentInput {
   email: string;
   amountUsdCents: bigint;
   instant: boolean;
+  /**
+   * Service fee charged on top of the donation (instant payments only). The
+   * payer is charged `amountUsdCents + premiumUsdCents`; only
+   * `amountUsdCents` is ever paid on-chain.
+   */
+  premiumUsdCents?: bigint;
   /** Beneficiary of the escrowed tokens, known before the payer ever reaches Stripe. */
   claimAddress?: string;
   /** Tokens the terminal previewed for this donation, as an integer string. */
@@ -56,15 +63,25 @@ export async function createPayment(
   pool: Queryable,
   input: CreatePaymentInput,
 ): Promise<PaymentRow> {
-  const { projectId, email, amountUsdCents, instant, claimAddress, quoteTokens } = input;
+  const {
+    projectId,
+    email,
+    amountUsdCents,
+    instant,
+    premiumUsdCents,
+    claimAddress,
+    quoteTokens,
+  } = input;
   const result = await pool.query<PaymentRow>(
-    `INSERT INTO payments (project_id, email, amount_usd_cents, instant, claim_address, quote_tokens)
-     VALUES ($1, $2, $3, $4, $5, $6)
+    `INSERT INTO payments
+       (project_id, email, amount_usd_cents, premium_usd_cents, instant, claim_address, quote_tokens)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)
      RETURNING *`,
     [
       projectId,
       email,
       amountUsdCents,
+      premiumUsdCents ?? 0n,
       instant,
       claimAddress ?? null,
       quoteTokens === undefined ? null : quoteTokens.toString(),

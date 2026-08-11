@@ -48,10 +48,12 @@ describe("migrate", () => {
   it("is idempotent -- re-running does not error or duplicate objects", async () => {
     await expect(migrate(pool)).resolves.toBeUndefined();
     const { rows } = await pool.query(
-      "SELECT filename FROM schema_migrations",
+      "SELECT filename FROM schema_migrations ORDER BY filename",
     );
-    expect(rows).toHaveLength(1);
-    expect(rows[0]?.filename).toBe("001_init.sql");
+    expect(rows.map((row) => row.filename)).toEqual([
+      "001_init.sql",
+      "002_premium.sql",
+    ]);
   });
 });
 

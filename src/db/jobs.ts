@@ -1,3 +1,4 @@
+import type { Pool } from "pg";
 import type { Queryable } from "./payments.js";
 
 export interface JobRow {
@@ -61,13 +62,19 @@ export async function enqueue(
 }
 
 /**
+ * Takes a `Pool`, not a `Queryable`: the `FOR UPDATE SKIP LOCKED` row lock
+ * this acquires lives until the surrounding transaction ends, so claiming
+ * inside someone else's transaction would hold the lock past the intended
+ * hand-off and change what "claimed" means for every other worker. Only
+ * `enqueue` (which the webhook calls inside its own transaction) is widened.
+ *
  * Atomically claims the next ready job: not done, not currently locked, due
  * to run. `FOR UPDATE SKIP LOCKED` lets concurrent workers race this query
  * without blocking on each other -- a worker that loses the race sees the
  * row as locked and skips straight to the next candidate (or, with only one
  * ready job, finds none and returns null) instead of waiting.
  */
-export async function claimNext(pool: Queryable): Promise<JobRow | null> {
+export async function claimNext(pool: Pool): Promise<JobRow | null> {
   const result = await pool.query<JobRow>(
     `UPDATE jobs SET locked_at = now(), attempts = attempts + 1
      WHERE id = (
@@ -81,7 +88,7 @@ export async function claimNext(pool: Queryable): Promise<JobRow | null> {
 }
 
 /** Marks a claimed job done. */
-export async function complete(pool: Queryable, id: string): Promise<void> {
+export async function complete(pool: Pool, id: string): Promise<void> {
   await pool.query("UPDATE jobs SET done_at = now() WHERE id = $1", [id]);
 }
 
@@ -92,7 +99,7 @@ export async function complete(pool: Queryable, id: string): Promise<void> {
  * marked done with `last_error` prefixed "FATAL:" so it's never retried
  * again but is still visible as a terminal failure.
  */
-export async function fail(pool: Queryable, id: string, err: Error): Promise<void> {
+export async function fail(pool: Pool, id: string, err: Error): Promise<void> {
   const message = err.message;
 
   await pool.query(
@@ -114,7 +121,7 @@ export async function fail(pool: Queryable, id: string, err: Error): Promise<voi
  * before calling complete/fail, so the job becomes claimable again. A lock
  * older than 10 minutes is assumed abandoned.
  */
-export async function reapStale(pool: Queryable): Promise<void> {
+export async function reapStale(pool: Pool): Promise<void> {
   await pool.query(
     `UPDATE jobs SET locked_at = NULL
      WHERE locked_at IS NOT NULL AND locked_at < now() - interval '10 minutes'`,
