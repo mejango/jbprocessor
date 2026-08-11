@@ -13,7 +13,7 @@ const BYTES32_PATTERN = /^0x[0-9a-fA-F]{64}$/;
  * Read fresh from the environment on every call (not memoized) so tests can
  * set/unset it freely; the parse itself is cheap.
  */
-function escrowAddress(): Address {
+export function escrowAddress(): Address {
   const value = process.env.ESCROW_ADDRESS;
   if (!value) {
     throw new Error("ESCROW_ADDRESS environment variable is not set");

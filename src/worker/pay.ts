@@ -2,8 +2,9 @@ import type { Pool } from "pg";
 import type Stripe from "stripe";
 import { isAddress, type Address, type Hex } from "viem";
 import type { ChainClients } from "../chain/client.js";
-import { transferFrom } from "../chain/erc20.js";
+import { balanceOf, transferFrom } from "../chain/erc20.js";
 import {
+  escrowAddress,
   feePaymentId,
   getEntry,
   paymentIdBytes32,
@@ -26,6 +27,7 @@ import {
   TransitionError,
   type PaymentRow,
   type PaymentPatch,
+  type PaymentState,
   type Queryable,
 } from "../db/payments.js";
 import { envAddress } from "../env.js";
@@ -50,6 +52,13 @@ export interface ReceiptEmailJobPayload {
  * an RPC. `liveChain` is the production implementation.
  */
 export interface PayChain {
+  /**
+   * Resolves everything this payment will need from the environment, throwing
+   * on anything missing or malformed. Called before the `paid -> paying` gate
+   * so a misconfigured deployment fails while the payment is still untouched,
+   * rather than stranding it in `paying`.
+   */
+  assertConfigured(options: { instant: boolean }): void;
   quoteTokens(params: QuoteTokensParams): Promise<bigint>;
   /**
    * Tokens the escrow already holds for this payment id, or null when it has
@@ -61,19 +70,22 @@ export interface PayChain {
   processPayment(params: ProcessPaymentParams): Promise<ProcessPaymentResult>;
   /** Draws USDC from the instant pool Safe to the worker, against its allowance. */
   drawFromInstantPool(amountWei: bigint): Promise<Hex>;
+  /** The worker wallet's own USDC balance -- the belt on a lost draw record. */
+  workerUsdcBalance(): Promise<bigint>;
 }
 
-/** The slice of the Stripe SDK the payer writes to. */
-export interface StripeRefundCreator {
+/** The slice of the Stripe SDK the payer reads and writes refunds through. */
+export interface StripeRefunds {
   refunds: {
     create(
       params: Stripe.RefundCreateParams,
       options?: Stripe.RequestOptions,
     ): Promise<{ id: string }>;
+    list(params: Stripe.RefundListParams): Promise<{ data: Array<{ id: string }> }>;
   };
 }
 
-export type PayStripe = StripePaymentIntentReader & StripeRefundCreator;
+export type PayStripe = StripePaymentIntentReader & StripeRefunds;
 
 export interface PayDeps {
   pool: Pool;
@@ -81,26 +93,36 @@ export interface PayDeps {
   chain: PayChain;
 }
 
+function requireWorkerAccount(clients: ChainClients) {
+  const account = clients.walletClient.account;
+  if (!account) {
+    throw new Error("liveChain: walletClient has no account configured");
+  }
+  return account;
+}
+
 /** The live `PayChain`, bound to a viem client pair. */
 export function liveChain(clients: ChainClients): PayChain {
   return {
+    assertConfigured: ({ instant }) => {
+      requireWorkerAccount(clients);
+      escrowAddress();
+      if (instant) envAddress("INSTANT_POOL_ADDRESS");
+    },
     quoteTokens: (params) => quoteTokens(clients.publicClient, params),
     entryTokensHeld: async (paymentId) => (await getEntry(clients, paymentId))?.amount ?? null,
     processPayment: (params) => processPayment(clients, params),
-    drawFromInstantPool: async (amountWei) => {
-      const account = clients.walletClient.account;
-      if (!account) {
-        throw new Error("drawFromInstantPool: walletClient has no account configured");
-      }
-      return transferFrom(clients, {
+    drawFromInstantPool: async (amountWei) =>
+      transferFrom(clients, {
         token: USDC_ON_BASE,
         from: envAddress("INSTANT_POOL_ADDRESS"),
         // The spender is whoever signs, so the draw must land on the signer's
         // own address -- that's the address the pool granted the allowance to.
-        to: account.address,
+        to: requireWorkerAccount(clients).address,
         amount: amountWei,
-      });
-    },
+      }),
+    workerUsdcBalance: () =>
+      balanceOf(clients, USDC_ON_BASE, requireWorkerAccount(clients).address),
   };
 }
 
@@ -242,6 +264,64 @@ async function refundForDrift(
 }
 
 /**
+ * Draws this payment's USDC (donation + premium) out of the instant pool,
+ * at most once across every attempt.
+ *
+ * Three layers, because a draw is real money moving between two durable
+ * states: `pool_draw_tx` records a completed draw (checked first, written
+ * immediately after the transfer and before anything else can fail, so a
+ * reverting `processPayment` retried to exhaustion draws once, not once per
+ * attempt); and on a resumed attempt the worker's own USDC balance is checked
+ * too, which covers the one window `pool_draw_tx` can't -- a crash between the
+ * transfer landing and the row being written.
+ *
+ * The balance check is deliberately resume-only. The draw happens after the
+ * `paying` gate, so no first attempt can have drawn anything, and on a first
+ * attempt a healthy resting balance (default-rail USDC awaiting its own sends)
+ * would otherwise silently pay a pool-funded payment out of settlement funds.
+ *
+ * Reserving the same `amount + premium` in checkout's headroom is what keeps
+ * the pool from being over-committed -- see `instantPoolHeadroomWei` in
+ * `src/stripe/checkout.ts`; the two must always move together.
+ */
+async function drawFromInstantPool(
+  deps: PayDeps,
+  payment: PaymentRow,
+  totalWei: bigint,
+  resuming: boolean,
+): Promise<void> {
+  if (payment.pool_draw_tx) return;
+
+  if (resuming && (await deps.chain.workerUsdcBalance()) >= totalWei) {
+    console.warn(
+      `payment ${payment.id}: worker already holds ${totalWei} USDC base units, skipping the pool draw`,
+    );
+    return;
+  }
+
+  const txHash = await deps.chain.drawFromInstantPool(totalWei);
+  await deps.pool.query(
+    "UPDATE payments SET pool_draw_tx = $2, updated_at = now() WHERE id = $1",
+    [payment.id, txHash],
+  );
+}
+
+/**
+ * True when Stripe has already refunded this payment.
+ *
+ * Probed before a resumed attempt re-quotes: an attempt that crashed between
+ * issuing a drift refund and recording it leaves a payment in `paying` whose
+ * money is already back with the payer, and a fresh quote that has since
+ * recovered would otherwise pay for it on-chain anyway.
+ */
+async function alreadyRefunded(deps: PayDeps, payment: PaymentRow): Promise<boolean> {
+  const intentId = payment.stripe_payment_intent;
+  if (!intentId) return false;
+  const refunds = await deps.stripe.refunds.list({ payment_intent: intentId, limit: 1 });
+  return refunds.data.length > 0;
+}
+
+/**
  * The one commit that ends a successful pay: record what the escrow holds and
  * schedule everything that follows from it, in a single transaction. Split
  * across transactions, a crash in the middle would leave a `held` payment with
@@ -294,10 +374,16 @@ export async function handlePay(deps: PayDeps, job: JobRow): Promise<void> {
     return;
   }
 
-  // Anything outside {paid, paying} is either finished or retired: a dispute
-  // canceled it, a refund landed, or another attempt already escrowed it.
-  // Retrying would never change that, so the job is done.
-  if (payment.state !== "paid" && payment.state !== "paying") {
+  // 'settled' is the same pre-pay position as 'paid' (Stripe's money has
+  // landed) and must be payable from here: treating it as terminal would
+  // complete the job, burn the `pay:<id>` dedupe key, and leave the payment
+  // with nothing scheduled to ever pay it.
+  //
+  // Anything else is finished or retired: a dispute canceled it, a refund
+  // landed, or another attempt already escrowed it. Retrying would never
+  // change that, so the job is done.
+  const payable: PaymentState[] = ["paid", "settled"];
+  if (!payable.includes(payment.state) && payment.state !== "paying") {
     console.warn(`payment ${payment.id}: state is '${payment.state}', nothing to pay`);
     return;
   }
@@ -315,10 +401,11 @@ export async function handlePay(deps: PayDeps, job: JobRow): Promise<void> {
   const amountWei = BigInt(payment.amount_usd_cents) * USDC_WEI_PER_CENT;
   const premiumWei = BigInt(payment.premium_usd_cents) * USDC_WEI_PER_CENT;
 
-  // Resolved up front, before anything moves: a malformed processor config
-  // must fail while the payment is still untouched, not after the donation
-  // leg has landed and the fee leg is all that stands between the payer and
-  // their escrowed tokens.
+  // Resolved up front, before anything moves: a bad environment must fail
+  // while the payment is still untouched, not after the donation leg has
+  // landed and a misconfigured fee leg is all that stands between the payer
+  // and their escrowed tokens.
+  deps.chain.assertConfigured({ instant: payment.instant });
   const processor = payment.instant && premiumWei > 0n ? processorProject() : null;
 
   let resuming = payment.state === "paying";
@@ -328,7 +415,7 @@ export async function handlePay(deps: PayDeps, job: JobRow): Promise<void> {
     if (!payment.instant) await requireStripeMoneyAvailable(deps, payment);
 
     try {
-      await transition(deps.pool, payment.id, ["paid"], "paying");
+      await transition(deps.pool, payment.id, payable, "paying");
     } catch (err) {
       if (!(err instanceof TransitionError)) throw err;
       // The row moved under us between the load and the gate -- a dispute or a
@@ -352,6 +439,14 @@ export async function handlePay(deps: PayDeps, job: JobRow): Promise<void> {
   let payTx: Hex | undefined;
 
   if (alreadyHeld === null) {
+    // Nothing is on-chain, so a resumed attempt might be resuming a refund
+    // rather than a send. Ask Stripe before quoting anything.
+    if (resuming && (await alreadyRefunded(deps, payment))) {
+      console.warn(`payment ${payment.id}: already refunded at Stripe -- recording, not paying`);
+      await transition(deps.pool, payment.id, ["paying"], "refunded");
+      return;
+    }
+
     const quoteNow = await deps.chain.quoteTokens({
       terminal,
       projectId: BigInt(payment.project_id),
@@ -372,7 +467,9 @@ export async function handlePay(deps: PayDeps, job: JobRow): Promise<void> {
     // After the drift gate, never before it: drawing and then refunding would
     // strand pool USDC in the worker wallet with no payment left to spend it
     // on. Nothing between here and the send needs the funds.
-    if (payment.instant) await deps.chain.drawFromInstantPool(amountWei + premiumWei);
+    if (payment.instant) {
+      await drawFromInstantPool(deps, payment, amountWei + premiumWei, resuming);
+    }
 
     const result = await deps.chain.processPayment({
       paymentId: escrowPaymentId,

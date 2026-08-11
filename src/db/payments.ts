@@ -38,6 +38,8 @@ export interface PaymentRow {
   unlock_at: Date | null;
   claim_address: string | null;
   release_tx: string | null;
+  /** Set once the worker has drawn this payment's USDC from the instant pool. */
+  pool_draw_tx: string | null;
   created_at: Date;
   updated_at: Date;
 }

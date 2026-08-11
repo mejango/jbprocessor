@@ -298,6 +298,27 @@ describe("createCheckoutSession -- instant pool headroom", () => {
     expect(result.url).toContain("checkout.stripe.com");
   });
 
+  it("reserves the premium as well as the donation for in-flight instant payments", async () => {
+    // The worker draws amount + premium out of the pool, so headroom has to
+    // reserve both: 50.00 donation + 0.75 premium = 50.75 committed.
+    await pool.query(
+      `INSERT INTO payments (project_id, email, amount_usd_cents, premium_usd_cents, instant, state)
+       VALUES ($1, 'premium-inflight@example.com', 5000, 75, true, 'paid')`,
+      [PROJECT_ID],
+    );
+
+    // Exactly enough for the donation alone -- but not for what will be drawn.
+    const d = deps({ readAllowance: async () => 100_750_000n - 1n });
+    await expect(
+      createCheckoutSession(d, {
+        projectId: PROJECT_ID,
+        amountUsdCents: 5000n,
+        email: "second-instant@example.com",
+        instant: true,
+      }),
+    ).rejects.toMatchObject({ code: "insufficient_pool_headroom" });
+  });
+
   it("ignores terminal-state payments when summing in-flight instant volume", async () => {
     await pool.query(
       `INSERT INTO payments (project_id, email, amount_usd_cents, instant, state)

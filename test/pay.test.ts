@@ -8,7 +8,7 @@ import { enqueue, claimNext, type JobRow } from "../src/db/jobs.js";
 import { migrate } from "../src/db/index.js";
 import { createPayment, type PaymentState } from "../src/db/payments.js";
 import { handlePay, type PayChain, type PayDeps } from "../src/worker/pay.js";
-import { runWorkerOnce } from "../src/worker/index.js";
+import { runWorkerOnce, startWorker } from "../src/worker/index.js";
 
 const TEST_DATABASE_URL =
   process.env.TEST_DATABASE_URL ?? "postgres://localhost:5432/jbprocessor_test";
@@ -34,6 +34,9 @@ let pool: Pool;
 /** Fake of every on-chain operation the payer worker makes. */
 class FakeChain implements PayChain {
   quote = 1_000_000n;
+  /** What the worker wallet holds; the draw belt reads this on a resume. */
+  workerBalance = 0n;
+  configErrors: Error | null = null;
   /** paymentId (bytes32) -> tokens held, i.e. the escrow's `entries` mapping. */
   entries = new Map<string, bigint>();
   processed: ProcessPaymentParams[] = [];
@@ -41,7 +44,17 @@ class FakeChain implements PayChain {
   draws: bigint[] = [];
   /** Set to a bytes32 paymentId to make the next processPayment for it throw. */
   failProcessFor: string | null = null;
+  /** When true, every processPayment reverts -- a permanently failing send. */
+  alwaysFailProcess = false;
   private txCounter = 0;
+
+  assertConfigured(_options: { instant: boolean }): void {
+    if (this.configErrors) throw this.configErrors;
+  }
+
+  async workerUsdcBalance(): Promise<bigint> {
+    return this.workerBalance;
+  }
 
   async quoteTokens(params: QuoteTokensParams): Promise<bigint> {
     this.quoteCalls.push(params);
@@ -53,6 +66,9 @@ class FakeChain implements PayChain {
   }
 
   async processPayment(params: ProcessPaymentParams): Promise<ProcessPaymentResult> {
+    if (this.alwaysFailProcess) {
+      throw new Error("terminal reverted");
+    }
     if (this.failProcessFor === params.paymentId) {
       this.failProcessFor = null;
       throw new Error("rpc exploded mid-send");
@@ -81,6 +97,9 @@ class FakeStripe {
   balanceTransactionStatus: string | null = "available";
   retrieved: string[] = [];
   refundCalls: Array<{ params: unknown; options: unknown }> = [];
+  /** Refunds Stripe already knows about, as `refunds.list` would report them. */
+  existingRefunds: Array<{ id: string }> = [];
+  listCalls: unknown[] = [];
   /** Runs inside `paymentIntents.retrieve`, to simulate a concurrent state change. */
   onRetrieve: (() => Promise<void>) | null = null;
 
@@ -110,7 +129,13 @@ class FakeStripe {
   refunds = {
     create: async (params: unknown, options?: unknown) => {
       this.refundCalls.push({ params, options });
-      return { id: "re_test" };
+      const refund = { id: `re_test_${this.refundCalls.length}` };
+      this.existingRefunds.push(refund);
+      return refund;
+    },
+    list: async (params: unknown) => {
+      this.listCalls.push(params);
+      return { data: this.existingRefunds.slice(0, 1) };
     },
   };
 }
@@ -164,7 +189,8 @@ async function readPayment(id: string) {
     state: PaymentState;
     tokens_held: string | null;
     pay_tx: string | null;
-  }>("SELECT state, tokens_held, pay_tx FROM payments WHERE id = $1", [id]);
+    pool_draw_tx: string | null;
+  }>("SELECT state, tokens_held, pay_tx, pool_draw_tx FROM payments WHERE id = $1", [id]);
   const row = rows[0];
   if (!row) throw new Error(`payment ${id} not found`);
   return row;
@@ -480,6 +506,135 @@ describe("handlePay -- instant", () => {
   });
 });
 
+describe("handlePay -- the pool draw happens at most once", () => {
+  it("draws once no matter how many times a permanently reverting send is retried", async () => {
+    const payment = await seedPayment({
+      instant: true,
+      amountUsdCents: 10_000n,
+      premiumUsdCents: 150n,
+    });
+    const chain = new FakeChain();
+    chain.alwaysFailProcess = true;
+    const stripe = new FakeStripe();
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await expect(handlePay(deps(chain, stripe), payJob(payment.id))).rejects.toThrow(
+        /terminal reverted/,
+      );
+    }
+
+    // Without a recorded draw, each retry would pull another 10_150 USDC out of
+    // the pool -- up to max_attempts times -- and checkout would never see it.
+    expect(chain.draws).toHaveLength(1);
+    const row = await readPayment(payment.id);
+    expect(row.pool_draw_tx).not.toBeNull();
+    expect(row.state).toBe("paying");
+  });
+
+  it("does not draw again when the payment already has a recorded draw", async () => {
+    const payment = await seedPayment({
+      state: "paying",
+      instant: true,
+      amountUsdCents: 10_000n,
+      premiumUsdCents: 150n,
+    });
+    await pool.query("UPDATE payments SET pool_draw_tx = '0xdrawn' WHERE id = $1", [
+      payment.id,
+    ]);
+    const chain = new FakeChain();
+
+    await handlePay(deps(chain, new FakeStripe()), payJob(payment.id));
+
+    expect(chain.draws).toHaveLength(0);
+    expect(chain.processed).toHaveLength(1);
+    expect((await readPayment(payment.id)).state).toBe("held");
+  });
+
+  it("skips a resumed draw when the worker already holds the USDC (lost draw record)", async () => {
+    const payment = await seedPayment({
+      state: "paying",
+      instant: true,
+      amountUsdCents: 10_000n,
+      premiumUsdCents: 150n,
+    });
+    const chain = new FakeChain();
+    chain.workerBalance = 10_150n * USDC_WEI_PER_CENT;
+
+    await handlePay(deps(chain, new FakeStripe()), payJob(payment.id));
+
+    expect(chain.draws).toHaveLength(0);
+    expect(chain.processed).toHaveLength(1);
+  });
+
+  it("still draws on a first attempt even when the worker is holding other funds", async () => {
+    const payment = await seedPayment({
+      instant: true,
+      amountUsdCents: 10_000n,
+      premiumUsdCents: 150n,
+    });
+    const chain = new FakeChain();
+    // Default-rail USDC resting in the settlement wallet is not this payment's
+    // money: a first attempt has never drawn, so it must still draw.
+    chain.workerBalance = 1_000_000n * USDC_WEI_PER_CENT;
+
+    await handlePay(deps(chain, new FakeStripe()), payJob(payment.id));
+
+    expect(chain.draws).toEqual([10_150n * USDC_WEI_PER_CENT]);
+  });
+});
+
+describe("handlePay -- resuming after a refund", () => {
+  it("records the refund instead of paying when Stripe has already refunded", async () => {
+    const payment = await seedPayment({ state: "paying" });
+    const chain = new FakeChain();
+    const stripe = new FakeStripe();
+    stripe.existingRefunds = [{ id: "re_earlier" }];
+
+    await handlePay(deps(chain, stripe), payJob(payment.id));
+
+    // The quote may well have recovered by now; paying anyway would send USDC
+    // on-chain for money already back with the payer.
+    expect(chain.quoteCalls).toHaveLength(0);
+    expect(chain.processed).toHaveLength(0);
+    expect(stripe.refundCalls).toHaveLength(0);
+    expect((await readPayment(payment.id)).state).toBe("refunded");
+  });
+
+  it("does not probe for refunds on a fresh attempt", async () => {
+    const payment = await seedPayment();
+    const stripe = new FakeStripe();
+
+    await handlePay(deps(new FakeChain(), stripe), payJob(payment.id));
+
+    expect(stripe.listCalls).toHaveLength(0);
+    expect((await readPayment(payment.id)).state).toBe("held");
+  });
+});
+
+describe("handlePay -- pre-pay states and config", () => {
+  it("pays a payment in 'settled' just like one in 'paid'", async () => {
+    const payment = await seedPayment({ state: "settled" });
+    const chain = new FakeChain();
+
+    await handlePay(deps(chain, new FakeStripe()), payJob(payment.id));
+
+    expect(chain.processed).toHaveLength(1);
+    expect((await readPayment(payment.id)).state).toBe("held");
+  });
+
+  it("fails before the gate on a bad environment, leaving the payment payable", async () => {
+    const payment = await seedPayment();
+    const chain = new FakeChain();
+    chain.configErrors = new Error("ESCROW_ADDRESS environment variable is not set");
+
+    await expect(
+      handlePay(deps(chain, new FakeStripe()), payJob(payment.id)),
+    ).rejects.toThrow(/ESCROW_ADDRESS/);
+
+    expect((await readPayment(payment.id)).state).toBe("paid");
+  });
+});
+
 describe("handlePay -- bad input", () => {
   it("completes silently for a payment id that does not exist", async () => {
     const chain = new FakeChain();
@@ -552,6 +707,39 @@ describe("runWorkerOnce", () => {
     expect(rows[0]?.last_error).toBeTruthy();
     expect((await readPayment(payment.id)).state).toBe("paid");
   });
+
+  it("survives a queue error instead of exiting, and stops on SIGTERM", async () => {
+    const payment = await seedPayment();
+    await enqueue(pool, "pay", { paymentId: payment.id });
+
+    // A pool whose first call fails: the loop must log and keep going, not
+    // take the whole worker process down with it.
+    let calls = 0;
+    const flakyPool = {
+      query: async (...args: unknown[]) => {
+        calls += 1;
+        if (calls === 1) throw new Error("connection terminated unexpectedly");
+        return (pool.query as (...a: unknown[]) => unknown)(...args);
+      },
+      connect: () => pool.connect(),
+    } as unknown as Pool;
+
+    const running = startWorker({
+      ...deps(new FakeChain(), new FakeStripe()),
+      pool: flakyPool,
+    });
+
+    // Give the loop time to eat the error, sleep, and come back for the job.
+    const deadline = Date.now() + 10_000;
+    while (Date.now() < deadline) {
+      if ((await readPayment(payment.id)).state === "held") break;
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    expect((await readPayment(payment.id)).state).toBe("held");
+
+    process.emit("SIGTERM");
+    await expect(running).resolves.toBeUndefined();
+  }, 20_000);
 
   it("reaps a stale lock so an abandoned job is claimable again", async () => {
     const payment = await seedPayment();

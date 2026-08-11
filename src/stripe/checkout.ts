@@ -122,7 +122,15 @@ interface ProjectRow {
 
 /**
  * How much instant-pool USDC is still uncommitted: the pool's standing
- * allowance to the worker, minus every in-flight instant payment's donation.
+ * allowance to the worker, minus everything every in-flight instant payment
+ * will draw.
+ *
+ * The reservation is `amount + premium`, matching what the worker actually
+ * pulls out of the pool (`drawFromInstantPool` in `src/worker/pay.ts`) -- the
+ * premium is fronted by the pool exactly like the donation is. Reserving only
+ * the donation would let checkout sell headroom the pool doesn't have, and the
+ * shortfall would land on a later payer as a payment stuck mid-flight. If the
+ * worker's draw ever changes, this sum changes with it.
  *
  * The worker address comes from `WORKER_ADDRESS`, deliberately *not* derived
  * from `WORKER_PRIVATE_KEY` -- checkout runs in the web process, which must
@@ -138,7 +146,7 @@ export async function instantPoolHeadroomWei(
   );
 
   const { rows } = await pool.query<{ committed_cents: string }>(
-    `SELECT COALESCE(SUM(amount_usd_cents), 0)::text AS committed_cents
+    `SELECT COALESCE(SUM(amount_usd_cents + premium_usd_cents), 0)::text AS committed_cents
        FROM payments
       WHERE instant AND state = ANY($1)`,
     [IN_FLIGHT_INSTANT_STATES],

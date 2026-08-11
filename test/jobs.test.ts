@@ -139,6 +139,43 @@ describe("fail", () => {
     const claimed = await claimNext(pool);
     expect(claimed).toBeNull();
   });
+
+  it("releases the dedupe key when it goes FATAL, so the work can be queued again", async () => {
+    const job = await enqueue(pool, "gives_up", { paymentId: "p1" }, {
+      dedupeKey: "pay:p1",
+    });
+
+    for (let i = 0; i < 8; i++) {
+      await claimNext(pool);
+      await fail(pool, job.id, new Error("nope"));
+      await pool.query(
+        "UPDATE jobs SET run_at = now() - interval '1 second' WHERE id = $1",
+        [job.id],
+      );
+    }
+
+    const { rows } = await pool.query<{ dedupe_key: string | null }>(
+      "SELECT dedupe_key FROM jobs WHERE id = $1",
+      [job.id],
+    );
+    expect(rows[0]?.dedupe_key).toBeNull();
+
+    // A fixed handler (or an operator) can now re-queue the same logical work.
+    const requeued = await enqueue(pool, "gives_up", { paymentId: "p1" }, {
+      dedupeKey: "pay:p1",
+    });
+    expect(requeued.id).not.toBe(job.id);
+    expect(requeued.done_at).toBeNull();
+  });
+
+  it("keeps the dedupe key while the job is still retryable", async () => {
+    const job = await enqueue(pool, "still_trying", {}, { dedupeKey: "pay:p2" });
+    await claimNext(pool);
+    await fail(pool, job.id, new Error("transient"));
+
+    const second = await enqueue(pool, "still_trying", {}, { dedupeKey: "pay:p2" });
+    expect(second.id).toBe(job.id);
+  });
 });
 
 describe("complete", () => {

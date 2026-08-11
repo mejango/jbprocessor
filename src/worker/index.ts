@@ -80,21 +80,36 @@ export async function startWorker(deps: WorkerDeps = depsFromEnv()): Promise<voi
   process.on("SIGTERM", stop);
   process.on("SIGINT", stop);
 
+  // Interruptible idle: a signal during the sleep exits immediately instead of
+  // waiting out the full poll interval.
+  const idle = () =>
+    new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, IDLE_SLEEP_MS);
+      wake = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+    }).finally(() => {
+      wake = null;
+    });
+
   try {
     while (!stopping) {
-      const worked = await runWorkerOnce(deps);
+      let worked = false;
+      try {
+        worked = await runWorkerOnce(deps);
+      } catch (err) {
+        // runWorkerOnce only throws when the queue itself is unreachable (the
+        // handler's own errors are recorded by `fail`). That's transient and
+        // shared by every job, so the loop waits it out -- exiting here would
+        // turn a blip in the database into a stopped payment pipeline.
+        console.error(
+          `worker loop error: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
       if (worked || stopping) continue;
 
-      // Interruptible idle: a signal during the sleep exits immediately
-      // instead of waiting out the full poll interval.
-      await new Promise<void>((resolve) => {
-        const timer = setTimeout(resolve, IDLE_SLEEP_MS);
-        wake = () => {
-          clearTimeout(timer);
-          resolve();
-        };
-      });
-      wake = null;
+      await idle();
     }
   } finally {
     process.off("SIGTERM", stop);

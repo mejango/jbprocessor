@@ -98,6 +98,11 @@ export async function complete(pool: Pool, id: string): Promise<void> {
  * unless attempts have reached max_attempts, in which case the job is
  * marked done with `last_error` prefixed "FATAL:" so it's never retried
  * again but is still visible as a terminal failure.
+ *
+ * Going FATAL also releases the `dedupe_key`. The key exists to stop the same
+ * logical work being queued twice while it's still live; a job that has given
+ * up is not live, and holding the key would make the work unschedulable
+ * forever -- so a fixed handler (or an operator) can re-enqueue it.
  */
 export async function fail(pool: Pool, id: string, err: Error): Promise<void> {
   const message = err.message;
@@ -110,7 +115,8 @@ export async function fail(pool: Pool, id: string, err: Error): Promise<void> {
          ELSE $2::text
        END,
        run_at = now() + interval '30 seconds' * 2 ^ attempts,
-       done_at = CASE WHEN attempts >= max_attempts THEN now() ELSE done_at END
+       done_at = CASE WHEN attempts >= max_attempts THEN now() ELSE done_at END,
+       dedupe_key = CASE WHEN attempts >= max_attempts THEN NULL ELSE dedupe_key END
      WHERE id = $1`,
     [id, message],
   );

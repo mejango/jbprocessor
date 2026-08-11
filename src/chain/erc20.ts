@@ -2,6 +2,20 @@ import type { Address, Hex } from "viem";
 import { erc20Abi } from "./abi/erc20.js";
 import type { ChainClients } from "./client.js";
 
+/** Reads an ERC-20 balance. */
+export async function balanceOf(
+  { publicClient }: Pick<ChainClients, "publicClient">,
+  token: Address,
+  account: Address,
+): Promise<bigint> {
+  return publicClient.readContract({
+    address: token,
+    abi: erc20Abi,
+    functionName: "balanceOf",
+    args: [account],
+  });
+}
+
 export interface TransferFromParams {
   token: Address;
   /** Whose balance is being spent -- must have approved the wallet client's account. */
