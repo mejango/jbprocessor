@@ -1,0 +1,18 @@
+# Node
+node_modules/
+.env
+.env.*
+!.env.example
+
+# Next.js
+.next/
+out/
+
+# Foundry (contracts/lib is managed as git submodules)
+contracts/out/
+contracts/cache/
+contracts/broadcast/
+
+# Editor / OS
+.DS_Store
+*.log

@@ -1,0 +1,28 @@
+{
+  "name": "juice-processor",
+  "version": "1.0.0",
+  "description": "JBProcessor: fiat-to-Juicebox payment service",
+  "private": true,
+  "scripts": {
+    "test": "vitest run"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "UNLICENSED",
+  "type": "commonjs",
+  "dependencies": {
+    "next": "^16.3.0",
+    "pg": "^8.23.0",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "resend": "^6.19.0",
+    "stripe": "^22.5.0",
+    "viem": "^2.55.13"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.21.0",
+    "@types/react": "^19.2.18",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.10"
+  }
+}

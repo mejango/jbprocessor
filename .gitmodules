@@ -1,0 +1,6 @@
+[submodule "contracts/lib/openzeppelin-contracts"]
+	path = contracts/lib/openzeppelin-contracts
+	url = https://github.com/OpenZeppelin/openzeppelin-contracts
+[submodule "contracts/lib/nana-core-v6"]
+	path = contracts/lib/nana-core-v6
+	url = https://github.com/Bananapus/nana-core-v6
