@@ -1,6 +1,7 @@
 import type { Address, Hex } from "viem";
 import { concatHex, keccak256, parseEventLogs, stringToHex } from "viem";
 import { escrowAbi } from "./abi/escrow.js";
+import type { AppPublicClient, AppWalletClient } from "./client.js";
 
 const ADDRESS_PATTERN = /^0x[0-9a-fA-F]{40}$/;
 const UUID_PATTERN =
@@ -70,37 +71,40 @@ export function feePaymentId(paymentId: Hex): Hex {
 }
 
 /**
- * The minimal slice of a viem PublicClient that escrow writes need --
- * simulate-then-write, plus waiting for the confirmation used to parse
- * `processPayment`'s `Processed` event. Lets tests pass a stub instead of a
- * real viem client, same pattern as `quoteTokens`'s `ReadContractClient`
- * (`src/chain/quote.ts`).
+ * Escrow writes take the same injectable client pair the rest of this
+ * service uses -- the real `publicClient()`/`walletClient()` singletons
+ * from `src/chain/client.ts` (Task 4), or a same-shape override (e.g. a
+ * client pointed at an anvil fork in `test/escrow.fork.test.ts`). Reusing
+ * `AppPublicClient`/`AppWalletClient` directly (rather than a hand-rolled
+ * structural subset, as `quoteTokens`'s read-only `ReadContractClient`
+ * does) avoids fighting viem's overloaded `simulateContract`/
+ * `writeContract` generics -- see the `client.ts` comment on why bare
+ * `PublicClient`/`WalletClient` annotations don't typecheck here.
  */
-export interface EscrowPublicClient {
-  simulateContract(args: {
-    address: Address;
-    abi: typeof escrowAbi;
-    functionName: string;
-    args: readonly unknown[];
-    account: unknown;
-  }): Promise<{ request: unknown }>;
-  waitForTransactionReceipt(args: {
-    hash: Hex;
-  }): Promise<{ logs: readonly unknown[] }>;
-}
-
-/** The minimal slice of a viem WalletClient that escrow writes need. */
-export interface EscrowWalletClient {
-  account: { address: Address } | null | undefined;
-  writeContract(request: unknown): Promise<Hex>;
-}
-
 export interface EscrowClients {
-  publicClient: EscrowPublicClient;
-  walletClient: EscrowWalletClient;
+  publicClient: AppPublicClient;
+  walletClient: AppWalletClient;
 }
 
-function requireAccount(walletClient: EscrowWalletClient, fnName: string) {
+const UINT48_MAX = 2 ** 48 - 1;
+
+/**
+ * viem/abitype represent Solidity `uintN` for N <= 48 as a JS `number`
+ * (not `bigint`) -- `unlockAt` is a `uint48`, so the contract call's args
+ * tuple needs a `number` here even though the rest of this module (and the
+ * `payments` table) deals in bigints for the wider `uint256` fields.
+ * `uint48`'s max value (~2.8e14) is well within `Number`'s safe integer
+ * range, so this conversion never loses precision for valid input.
+ */
+function toUint48(value: bigint | number, fieldName: string): number {
+  const asNumber = typeof value === "bigint" ? Number(value) : value;
+  if (!Number.isInteger(asNumber) || asNumber < 0 || asNumber > UINT48_MAX) {
+    throw new Error(`${fieldName} must be a non-negative integer that fits in a uint48, got: ${value}`);
+  }
+  return asNumber;
+}
+
+function requireAccount(walletClient: AppWalletClient, fnName: string) {
   const account = walletClient.account;
   if (!account) {
     throw new Error(`${fnName}: walletClient has no account configured`);
@@ -139,7 +143,7 @@ export async function processPayment(
   params: ProcessPaymentParams,
 ): Promise<ProcessPaymentResult> {
   const account = requireAccount(walletClient, "processPayment");
-  const unlockAtSeconds = BigInt(params.unlockAt);
+  const unlockAtSeconds = toUint48(params.unlockAt, "unlockAt");
   const address = escrowAddress();
 
   const { request } = await publicClient.simulateContract({

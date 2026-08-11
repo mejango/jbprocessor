@@ -16,6 +16,15 @@
  */
 export const escrowAbi = [
   {
+    type: "constructor",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "owner_", type: "address" },
+      { name: "operator_", type: "address" },
+      { name: "usdc", type: "address" },
+    ],
+  },
+  {
     type: "function",
     name: "processPayment",
     stateMutability: "nonpayable",
