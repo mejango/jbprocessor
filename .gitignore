@@ -16,3 +16,6 @@ contracts/broadcast/
 # Editor / OS
 .DS_Store
 *.log
+
+# TypeScript
+*.tsbuildinfo
