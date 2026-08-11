@@ -1,9 +1,26 @@
+import type { Pool } from "pg";
 import Stripe from "stripe";
 import { publicClient, walletClient } from "../chain/client.js";
 import { getPool } from "../db/index.js";
 import { claimNext, complete, fail, reapStale, type JobRow } from "../db/jobs.js";
+import { liveResend } from "../email/send.js";
 import { requireEnv } from "../env.js";
+import {
+  handleMagicLinkEmail,
+  handleReceiptEmail,
+  handleRedirectEmail,
+  handleReleaseEmail,
+  handleUnlockEmail,
+  type EmailJobDeps,
+} from "./emails.js";
+import { handleForfeit, liveForfeitChain, type ForfeitDeps } from "./forfeit.js";
 import { handlePay, liveChain, type PayDeps } from "./pay.js";
+import {
+  handleReconcile,
+  liveReconcileChain,
+  scheduleReconcile,
+  type ReconcileDeps,
+} from "./reconcile.js";
 import { handleRedirect, liveRedirectChain, type RedirectJobDeps } from "./redirect.js";
 import {
   handleReleaseScan,
@@ -12,23 +29,42 @@ import {
   scheduleReleaseScan,
   type ReleaseDeps,
 } from "./release.js";
+import {
+  handleRulesetWatch,
+  liveRulesetReads,
+  scheduleRulesetWatch,
+  type RulesetWatchDeps,
+} from "./watchRulesets.js";
 
-/** Everything any handler needs. Later tasks widen this as they add handlers. */
-export type WorkerDeps = PayDeps & ReleaseDeps & RedirectJobDeps;
+/** Everything any handler needs. */
+export type WorkerDeps = PayDeps &
+  ReleaseDeps &
+  RedirectJobDeps &
+  EmailJobDeps &
+  ForfeitDeps &
+  RulesetWatchDeps &
+  ReconcileDeps;
 
 export type JobHandler = (deps: WorkerDeps, job: JobRow) => Promise<void>;
 
 /**
- * Job kind -> handler. `receipt-email`, `forfeit` and the remaining recurring
- * cranks register here as they land. A kind with no handler fails (and
- * eventually goes FATAL) rather than being silently completed -- an
- * unregistered kind should be loud, not a quietly dropped payment.
+ * Job kind -> handler. A kind with no handler fails (and eventually goes
+ * FATAL) rather than being silently completed -- an unregistered kind should
+ * be loud, not a quietly dropped payment.
  */
 export const handlers: Record<string, JobHandler> = {
   pay: handlePay,
   "unlock-note": handleUnlockNote,
   "release-scan": handleReleaseScan,
   redirect: handleRedirect,
+  forfeit: handleForfeit,
+  "ruleset-watch": handleRulesetWatch,
+  reconcile: handleReconcile,
+  "magic-link-email": handleMagicLinkEmail,
+  "receipt-email": handleReceiptEmail,
+  "unlock-email": handleUnlockEmail,
+  "redirect-email": handleRedirectEmail,
+  "release-email": handleReleaseEmail,
 };
 
 const IDLE_SLEEP_MS = 2_000;
@@ -71,12 +107,27 @@ function depsFromEnv(): WorkerDeps {
     pool: getPool(),
     stripe: new Stripe(requireEnv("STRIPE_SECRET_KEY")),
     chain: liveChain(clients),
+    controller: liveRulesetReads(clients.publicClient),
+    resend: liveResend(),
     // The keeper reads and releases; the redirect handler reads and sets
-    // beneficiaries. One object, both slices -- the worker is the only process
-    // holding the escrow operator key.
-    escrow: { ...liveReleaseChain(clients), ...liveRedirectChain(clients) },
+    // beneficiaries; the dispute handler forfeits; reconciliation only reads.
+    // One object, every slice -- the worker is the only process holding the
+    // escrow operator key.
+    escrow: {
+      ...liveReleaseChain(clients),
+      ...liveRedirectChain(clients),
+      ...liveForfeitChain(clients),
+      ...liveReconcileChain(clients),
+    },
   };
 }
+
+/** The recurring cranks, and the seed each one needs to exist before it can extend itself. */
+const RECURRING_SEEDS: Array<{ name: string; seed: (pool: Pool, at: Date) => Promise<void> }> = [
+  { name: "release scan", seed: scheduleReleaseScan },
+  { name: "ruleset watch", seed: scheduleRulesetWatch },
+  { name: "reconciliation", seed: scheduleReconcile },
+];
 
 /**
  * Runs the poll loop until SIGTERM/SIGINT, then stops claiming and resolves
@@ -96,18 +147,23 @@ export async function startWorker(deps: WorkerDeps = depsFromEnv()): Promise<voi
   process.on("SIGTERM", stop);
   process.on("SIGINT", stop);
 
-  // The keeper is a self-scheduling chain, so it needs one link to exist
-  // before it can extend itself. Seeding on every boot (deduped to the current
-  // ten-minute bucket) is what makes a deployment that lost its queue -- or a
-  // brand new one -- start cranking without an operator.
-  try {
-    await scheduleReleaseScan(deps.pool, new Date());
-  } catch (err) {
-    console.error(
-      `worker boot: could not seed the release scan: ${
-        err instanceof Error ? err.message : String(err)
-      }`,
-    );
+  // Each crank is a self-scheduling chain, so it needs one link to exist
+  // before it can extend itself. Seeding on every boot (deduped to the
+  // crank's own time bucket) is what makes a deployment that lost its queue
+  // -- or a brand new one -- start cranking without an operator. Seeded
+  // independently, so one crank that can't be scheduled doesn't take the
+  // others down with it.
+  const bootAt = new Date();
+  for (const { name, seed } of RECURRING_SEEDS) {
+    try {
+      await seed(deps.pool, bootAt);
+    } catch (err) {
+      console.error(
+        `worker boot: could not seed the ${name}: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
   }
 
   // Interruptible idle: a signal during the sleep exits immediately instead of

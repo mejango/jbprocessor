@@ -297,6 +297,42 @@ export async function setBeneficiary(
   return { txHash };
 }
 
+export interface ForfeitParams {
+  paymentId: Hex;
+}
+
+export interface ForfeitResult {
+  txHash: Hex;
+}
+
+/**
+ * Calls `JBProcessorEscrow.forfeit`, clawing an entry's tokens back to the
+ * operator instead of delivering them to the payer. Operator-gated onchain.
+ *
+ * Reached from exactly one place: a chargeback on a payment whose tokens are
+ * already escrowed. Simulates first so `NoEntry` / `AlreadySettled` surface as
+ * such (the dispute handler distinguishes those from real faults -- a release
+ * that raced the dispute is a manual-recovery case, not a job to retry), and
+ * waits for the receipt, because the alert this triggers tells an operator the
+ * tokens are back and ready to cash out.
+ */
+export async function forfeit(
+  { publicClient, walletClient }: EscrowClients,
+  params: ForfeitParams,
+): Promise<ForfeitResult> {
+  const account = requireAccount(walletClient, "forfeit");
+  const { request } = await publicClient.simulateContract({
+    address: escrowAddress(),
+    abi: escrowAbi,
+    functionName: "forfeit",
+    args: [params.paymentId],
+    account,
+  });
+  const txHash = await walletClient.writeContract(request);
+  await confirm(publicClient, txHash, "forfeit");
+  return { txHash };
+}
+
 export interface ReleaseParams {
   paymentId: Hex;
 }
