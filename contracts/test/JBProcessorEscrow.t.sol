@@ -102,6 +102,16 @@ contract JBProcessorEscrowTest is Test {
         _processPayment(paymentId, address(0), unlockAt);
     }
 
+    function test_processPayment_revertsOnZeroUnlock() public {
+        bytes32 paymentId = keccak256("payment-1");
+
+        // unlockAt == 0 is the "no entry" sentinel used elsewhere (EntryExists / NoEntry checks);
+        // an entry created with it would be permanently unreachable and would also let the same
+        // paymentId be reprocessed, stranding the first batch of tokens.
+        vm.expectRevert(JBProcessorEscrow.ZeroUnlock.selector);
+        _processPayment(paymentId, beneficiary, 0);
+    }
+
     function test_processPayment_onlyOperator() public {
         bytes32 paymentId = keccak256("payment-1");
         uint48 unlockAt = uint48(block.timestamp + 7 days);

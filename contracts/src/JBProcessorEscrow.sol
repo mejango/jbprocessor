@@ -26,6 +26,7 @@ contract JBProcessorEscrow is Ownable {
     error EntryExists();
     error NoEntry();
     error ZeroBeneficiary();
+    error ZeroUnlock();
     error StillLocked();
     error AlreadySettled();
     error UnlockPassed();
@@ -75,6 +76,7 @@ contract JBProcessorEscrow is Ownable {
         string calldata memo
     ) external onlyOperator returns (uint256 tokensHeld) {
         if (entries[paymentId].unlockAt != 0) revert EntryExists();
+        if (unlockAt == 0) revert ZeroUnlock();
         if (beneficiary == address(0)) revert ZeroBeneficiary();
         USDC.safeTransferFrom(msg.sender, address(this), usdcAmount);
         USDC.forceApprove(address(terminal), usdcAmount);

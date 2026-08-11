@@ -9,7 +9,7 @@
   "keywords": [],
   "author": "",
   "license": "UNLICENSED",
-  "type": "commonjs",
+  "type": "module",
   "dependencies": {
     "next": "^16.3.0",
     "pg": "^8.23.0",
@@ -22,7 +22,7 @@
   "devDependencies": {
     "@types/pg": "^8.21.0",
     "@types/react": "^19.2.18",
-    "typescript": "^7.0.2",
+    "typescript": "^5.9.3",
     "vitest": "^4.1.10"
   }
 }
