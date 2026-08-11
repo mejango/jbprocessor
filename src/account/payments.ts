@@ -103,6 +103,8 @@ export interface AccountPaymentView {
   quoteTokens: string | null;
   tokensHeld: string | null;
   destination: string | null;
+  /** A destination change that is queued but not yet onchain, if there is one. */
+  pendingDestination: string | null;
   unlockAt: string | null;
   /** Whole days until unlock, or null when there's nothing left to wait for. */
   unlockInDays: number | null;
@@ -117,6 +119,7 @@ interface AccountRow extends PublicRow {
   project_id: string;
   project_name: string;
   created_at: Date;
+  pending_to_address: string | null;
 }
 
 export interface ListOptions {
@@ -136,19 +139,37 @@ export async function listAccountPayments(
   const now = options.now?.() ?? Date.now();
 
   const { rows } = await pool.query<AccountRow>(
+    // The pending redirect is read from the job queue rather than a column:
+    // the destination isn't recorded until both escrow legs are onchain, so
+    // the queued job is the only place a payer's in-flight change exists.
     `SELECT p.id, p.project_id, pr.name AS project_name, p.state,
             p.amount_usd_cents, p.premium_usd_cents, p.quote_tokens, p.tokens_held,
-            p.claim_address, p.unlock_at, p.pay_tx, p.release_tx, p.created_at
+            p.claim_address, p.unlock_at, p.pay_tx, p.release_tx, p.created_at,
+            pending.to_address AS pending_to_address
        FROM payments p
        JOIN projects pr ON pr.project_id = p.project_id
+       LEFT JOIN LATERAL (
+         SELECT j.payload->>'to' AS to_address
+           FROM jobs j
+          WHERE j.kind = 'redirect'
+            AND j.done_at IS NULL
+            AND j.payload->>'paymentId' = p.id::text
+          ORDER BY j.id DESC
+          LIMIT 1
+       ) pending ON true
       WHERE lower(p.email) = $1
       ORDER BY p.created_at DESC`,
     [normalizeEmail(email)],
   );
 
   return rows.map((row) => {
+    // A payment with a redirect in flight can't take another one -- the same
+    // rule the request path enforces, shown as a disabled form rather than a
+    // rejection the payer has to discover by submitting.
     const canRedirect =
-      (row.state === "held" || row.state === "unlocked") && row.release_tx === null;
+      (row.state === "held" || row.state === "unlocked") &&
+      row.release_tx === null &&
+      row.pending_to_address === null;
 
     return {
       id: row.id,
@@ -161,6 +182,7 @@ export async function listAccountPayments(
       quoteTokens: row.quote_tokens,
       tokensHeld: row.tokens_held,
       destination: row.claim_address,
+      pendingDestination: row.pending_to_address,
       unlockAt: row.unlock_at ? row.unlock_at.toISOString() : null,
       unlockInDays: unlockInDays(row, now),
       payTx: row.pay_tx,

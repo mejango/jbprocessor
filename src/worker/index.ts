@@ -4,6 +4,7 @@ import { getPool } from "../db/index.js";
 import { claimNext, complete, fail, reapStale, type JobRow } from "../db/jobs.js";
 import { requireEnv } from "../env.js";
 import { handlePay, liveChain, type PayDeps } from "./pay.js";
+import { handleRedirect, liveRedirectChain, type RedirectJobDeps } from "./redirect.js";
 import {
   handleReleaseScan,
   handleUnlockNote,
@@ -13,7 +14,7 @@ import {
 } from "./release.js";
 
 /** Everything any handler needs. Later tasks widen this as they add handlers. */
-export type WorkerDeps = PayDeps & ReleaseDeps;
+export type WorkerDeps = PayDeps & ReleaseDeps & RedirectJobDeps;
 
 export type JobHandler = (deps: WorkerDeps, job: JobRow) => Promise<void>;
 
@@ -27,6 +28,7 @@ export const handlers: Record<string, JobHandler> = {
   pay: handlePay,
   "unlock-note": handleUnlockNote,
   "release-scan": handleReleaseScan,
+  redirect: handleRedirect,
 };
 
 const IDLE_SLEEP_MS = 2_000;
@@ -69,7 +71,10 @@ function depsFromEnv(): WorkerDeps {
     pool: getPool(),
     stripe: new Stripe(requireEnv("STRIPE_SECRET_KEY")),
     chain: liveChain(clients),
-    escrow: liveReleaseChain(clients),
+    // The keeper reads and releases; the redirect handler reads and sets
+    // beneficiaries. One object, both slices -- the worker is the only process
+    // holding the escrow operator key.
+    escrow: { ...liveReleaseChain(clients), ...liveRedirectChain(clients) },
   };
 }
 

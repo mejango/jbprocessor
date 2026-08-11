@@ -256,9 +256,29 @@ export interface SetBeneficiaryResult {
 }
 
 /**
- * Calls `JBProcessorEscrow.setBeneficiary`. Simulates first, then writes.
- * Note the contract enforces a 48h `REDIRECT_DELAY` before the redirect
- * takes effect -- this call only queues it (see `BeneficiaryChanged`).
+ * Waits for a sent write to be mined and asserts it succeeded.
+ *
+ * A simulation that passed is not a transaction that landed: the chain can
+ * still reorder, run out of gas, or revert against state that moved between
+ * the simulation and inclusion. Every caller here records the hash as fact
+ * (`release_tx`, `claim_address`), so "sent" is never good enough -- the
+ * receipt is what makes the write true.
+ */
+async function confirm(
+  publicClient: EscrowClients["publicClient"],
+  txHash: Hex,
+  fnName: string,
+): Promise<void> {
+  const receipt = await publicClient.waitForTransactionReceipt({ hash: txHash });
+  if (receipt.status !== "success") {
+    throw new Error(`${fnName}: transaction ${txHash} reverted onchain`);
+  }
+}
+
+/**
+ * Calls `JBProcessorEscrow.setBeneficiary`. Simulates, writes, and waits for
+ * the receipt. Note the contract enforces a 48h `REDIRECT_DELAY` before the
+ * redirect takes effect -- this call only queues it (see `BeneficiaryChanged`).
  */
 export async function setBeneficiary(
   { publicClient, walletClient }: EscrowClients,
@@ -273,6 +293,7 @@ export async function setBeneficiary(
     account,
   });
   const txHash = await walletClient.writeContract(request);
+  await confirm(publicClient, txHash, "setBeneficiary");
   return { txHash };
 }
 
@@ -289,7 +310,10 @@ export interface ReleaseResult {
  * check in the contract) -- any funded account can crank an unlocked entry
  * -- but a signer is still required locally to pay gas, so `walletClient`
  * still needs an account. Simulates first so `StillLocked` /
- * `AlreadySettled` / `RedirectPending` reverts surface before sending.
+ * `AlreadySettled` / `RedirectPending` reverts surface before sending, then
+ * waits for the receipt: the keeper writes `release_tx` and moves the payment
+ * to `claimed` off the back of this call, and neither may happen for a
+ * transaction that never landed.
  */
 export async function release(
   { publicClient, walletClient }: EscrowClients,
@@ -304,5 +328,6 @@ export async function release(
     account,
   });
   const txHash = await walletClient.writeContract(request);
+  await confirm(publicClient, txHash, "release");
   return { txHash };
 }

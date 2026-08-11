@@ -1,10 +1,5 @@
-import {
-  liveRedirectEscrow,
-  RedirectError,
-  requestRedirect,
-} from "../../../src/account/redirect.js";
+import { RedirectError, requestRedirect } from "../../../src/account/redirect.js";
 import { sessionFromCookieHeader } from "../../../src/auth/magic.js";
-import { publicClient, walletClient } from "../../../src/chain/client.js";
 import { getPool } from "../../../src/db/index.js";
 import { readRequestFields } from "../fields.js";
 
@@ -13,10 +8,11 @@ import { readRequestFields } from "../fields.js";
  * design: a payer who does nothing still receives their tokens at the address
  * recorded at checkout.
  *
- * `setBeneficiary` is an operator-only call, so this route can only work in a
- * deployment whose web process is configured with the escrow operator's key.
- * Where it isn't, the client pair throws and the answer is an honest 503
- * rather than a 500 -- the redirect is unavailable, not broken.
+ * This route never signs anything. `setBeneficiary` is an operator-only call
+ * on the escrow -- and the same operator can `forfeit` -- so the key stays in
+ * the worker, and an accepted request is a queued job plus a 202, not a
+ * transaction hash. The redirect then takes the escrow's 48h delay before it
+ * takes effect anyway, so there was never a synchronous answer worth having.
  */
 export async function POST(request: Request): Promise<Response> {
   const { fields, isForm } = await readRequestFields(request);
@@ -26,25 +22,16 @@ export async function POST(request: Request): Promise<Response> {
     return respond(request, isForm, 401, { error: "unauthorized" }, "/login");
   }
 
-  const paymentId = fields.paymentId ?? "";
-  const address = fields.address ?? "";
-
-  let escrow;
-  try {
-    escrow = liveRedirectEscrow({
-      publicClient: publicClient(),
-      walletClient: walletClient(),
-    });
-  } catch {
-    return respond(request, isForm, 503, { error: "redirect_unavailable" }, "/account");
-  }
-
   try {
     const result = await requestRedirect(
-      { pool: getPool(), escrow },
-      { paymentId, address, sessionEmail },
+      { pool: getPool() },
+      {
+        paymentId: fields.paymentId ?? "",
+        address: fields.address ?? "",
+        sessionEmail,
+      },
     );
-    return respond(request, isForm, 200, { ok: true, ...result }, "/account?redirected=1");
+    return respond(request, isForm, 202, { ...result }, "/account?redirected=1");
   } catch (err) {
     if (err instanceof RedirectError) {
       return respond(

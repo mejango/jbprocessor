@@ -11,6 +11,9 @@ import type { Queryable } from "../db/payments.js";
 /** How long a mailed link stays good. Long enough to walk to a laptop, no longer. */
 const MAGIC_LINK_TTL_MINUTES = 15;
 
+/** One link per address per minute. See `requestMagicLink`. */
+const LINK_BUCKET_MS = 60_000;
+
 export interface LoginDeps {
   pool: Queryable;
 }
@@ -32,9 +35,12 @@ export interface MagicLinkEmailJobPayload {
  * always reports the same thing, so this is not an account-existence oracle.
  * A malformed address is dropped silently for the same reason.
  *
- * No dedupe key: a payer who clicks "email me a link" twice wants two links
- * (the first mail may have gone to spam), and each is independently
- * single-use.
+ * At most one link per address per minute, enforced by a bucketed dedupe key.
+ * A payer who clicks twice still gets a link (the first one, which is exactly
+ * what they wanted), while an attacker pointing a loop at this endpoint can
+ * neither mail-bomb the address nor fill the job queue with work that starves
+ * the keeper behind it. Extra requests are silent no-ops -- the response never
+ * changes, so the throttle isn't observable either.
  */
 export async function requestMagicLink(
   deps: LoginDeps,
@@ -43,12 +49,15 @@ export async function requestMagicLink(
 ): Promise<void> {
   if (!isEmailish(email)) return;
 
+  const now = options.now?.() ?? Date.now();
   const normalized = normalizeEmail(email);
   const payload: MagicLinkEmailJobPayload = {
     email: normalized,
     token: signToken(normalized, MAGIC_LINK_TTL_MINUTES, options),
   };
-  await enqueue(deps.pool, "magic-link-email", payload);
+  await enqueue(deps.pool, "magic-link-email", payload, {
+    dedupeKey: `magic-link:${normalized}:${Math.floor(now / LINK_BUCKET_MS)}`,
+  });
 }
 
 /**

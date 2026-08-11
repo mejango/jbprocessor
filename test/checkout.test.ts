@@ -389,7 +389,10 @@ describe("createCheckoutSession -- happy path", () => {
 
     // metadata.payment_id is the only link Stripe carries back to us.
     expect(d.stripe.lastCall.metadata?.payment_id).toBe(result.paymentId);
-    expect(d.stripe.lastCall.success_url).toContain("https://processor.test");
+    // Stripe sends the payer to the status page built on the public payment view.
+    expect(d.stripe.lastCall.success_url).toBe(
+      `https://processor.test/done?payment_id=${result.paymentId}`,
+    );
     expect(d.stripe.lastCall.cancel_url).toContain("https://processor.test");
   });
 

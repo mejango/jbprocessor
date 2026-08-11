@@ -12,6 +12,7 @@ import {
   type ReleaseChain,
   type ReleaseDeps,
 } from "../src/worker/release.js";
+import { handleRedirect, type RedirectJobDeps } from "../src/worker/redirect.js";
 import { handlers } from "../src/worker/index.js";
 
 const TEST_DATABASE_URL =
@@ -29,12 +30,26 @@ const BENEFICIARY = addr("b0b1");
 
 let pool: Pool;
 
-/** Fake of the escrow reads and writes the keeper makes. */
+/** Fake of the escrow reads and writes the keeper and the redirect handler make. */
 class FakeEscrow implements ReleaseChain {
   entries = new Map<string, EscrowEntry>();
   released: string[] = [];
+  beneficiarySets: Array<{ paymentId: string; to: Address }> = [];
   failFor: string | null = null;
+  failSetFor: string | null = null;
   private counter = 0;
+
+  async setBeneficiary(paymentId: Hex, to: Address): Promise<Hex> {
+    if (this.failSetFor === paymentId) throw new Error("rpc exploded");
+    const entry = this.entries.get(paymentId);
+    if (!entry) throw new Error(`NoEntry: ${paymentId}`);
+    if (entry.settled) throw new Error(`AlreadySettled: ${paymentId}`);
+    entry.pendingBeneficiary = to;
+    entry.redirectEffectiveAt = Math.floor(Date.now() / 1000) + 48 * 3600;
+    this.beneficiarySets.push({ paymentId, to });
+    this.counter += 1;
+    return `0x${this.counter.toString(16).padStart(64, "0")}` as Hex;
+  }
 
   seed(paymentId: Hex, overrides: Partial<EscrowEntry> = {}): void {
     this.entries.set(paymentId, {
@@ -342,9 +357,129 @@ describe("scheduleReleaseScan", () => {
   });
 });
 
+describe("handleRedirect", () => {
+  function redirectDeps(): RedirectJobDeps {
+    return { pool, escrow };
+  }
+
+  function redirectJob(paymentId: string, to: string, id = "9"): JobRow {
+    return { ...SCAN_JOB, id, kind: "redirect", payload: { paymentId, to } };
+  }
+
+  const NEW_DEST = addr("de5711");
+
+  async function destinationOf(id: string): Promise<string | null> {
+    const { rows } = await pool.query<{ claim_address: string | null }>(
+      "SELECT claim_address FROM payments WHERE id = $1",
+      [id],
+    );
+    return rows[0]!.claim_address;
+  }
+
+  it("sets the beneficiary, records the destination, and enqueues the confirmation", async () => {
+    const id = await seedPayment("held");
+    escrow.seed(paymentIdBytes32(id));
+
+    await handleRedirect(redirectDeps(), redirectJob(id, NEW_DEST, "101"));
+
+    expect(escrow.beneficiarySets).toEqual([{ paymentId: paymentIdBytes32(id), to: NEW_DEST }]);
+    expect((await destinationOf(id))?.toLowerCase()).toBe(NEW_DEST.toLowerCase());
+    expect(await jobCount("redirect-email", id)).toBe(1);
+  });
+
+  it("moves the fee leg too, after the donation leg", async () => {
+    const id = await seedPayment("held");
+    const main = paymentIdBytes32(id);
+    const fee = feePaymentId(main);
+    escrow.seed(main);
+    escrow.seed(fee);
+
+    await handleRedirect(redirectDeps(), redirectJob(id, NEW_DEST, "102"));
+
+    expect(escrow.beneficiarySets.map((call) => call.paymentId)).toEqual([main, fee]);
+  });
+
+  it("throws on a fee-leg failure and records nothing, so the retry finishes the job", async () => {
+    const id = await seedPayment("held");
+    const main = paymentIdBytes32(id);
+    const fee = feePaymentId(main);
+    escrow.seed(main);
+    escrow.seed(fee);
+    escrow.failSetFor = fee;
+
+    await expect(
+      handleRedirect(redirectDeps(), redirectJob(id, NEW_DEST, "103")),
+    ).rejects.toThrow(/rpc exploded/);
+
+    // The donation leg is queued onchain, but the row still shows the old
+    // destination -- it is only written once both legs are in.
+    expect((await destinationOf(id))?.toLowerCase()).toBe(BENEFICIARY.toLowerCase());
+    expect(await jobCount("redirect-email", id)).toBe(0);
+
+    // The retry skips the leg that already points at this address, so the
+    // donation's 48h clock is not pushed out again.
+    escrow.failSetFor = null;
+    await handleRedirect(redirectDeps(), redirectJob(id, NEW_DEST, "103"));
+
+    expect(escrow.beneficiarySets.map((call) => call.paymentId)).toEqual([main, fee]);
+    expect((await destinationOf(id))?.toLowerCase()).toBe(NEW_DEST.toLowerCase());
+    expect(await jobCount("redirect-email", id)).toBe(1);
+  });
+
+  it("does nothing when the payment is no longer redirectable", async () => {
+    const id = await seedPayment("claimed", { release_tx: `0x${"55".repeat(32)}` });
+    escrow.seed(paymentIdBytes32(id));
+
+    await handleRedirect(redirectDeps(), redirectJob(id, NEW_DEST, "104"));
+
+    expect(escrow.beneficiarySets).toEqual([]);
+    expect(await jobCount("redirect-email", id)).toBe(0);
+  });
+
+  it("does nothing when the escrow already released the entry", async () => {
+    const id = await seedPayment("held");
+    escrow.seed(paymentIdBytes32(id), { settled: true });
+
+    await handleRedirect(redirectDeps(), redirectJob(id, NEW_DEST, "105"));
+
+    expect(escrow.beneficiarySets).toEqual([]);
+    expect((await destinationOf(id))?.toLowerCase()).toBe(BENEFICIARY.toLowerCase());
+  });
+
+  it("drops a job for a payment that no longer exists", async () => {
+    await expect(
+      handleRedirect(
+        redirectDeps(),
+        redirectJob("00000000-0000-4000-8000-000000000000", NEW_DEST, "106"),
+      ),
+    ).resolves.toBeUndefined();
+  });
+
+  it("throws when the escrow has no entry, so the failure is visible", async () => {
+    const id = await seedPayment("held");
+    await expect(
+      handleRedirect(redirectDeps(), redirectJob(id, NEW_DEST, "107")),
+    ).rejects.toThrow(/no entry/i);
+  });
+
+  it("throws on a malformed payload rather than sending anywhere", async () => {
+    const id = await seedPayment("held");
+    escrow.seed(paymentIdBytes32(id));
+
+    await expect(
+      handleRedirect(redirectDeps(), redirectJob(id, "0xnope", "108")),
+    ).rejects.toThrow(/not a valid address/);
+    await expect(
+      handleRedirect(redirectDeps(), { ...SCAN_JOB, kind: "redirect", payload: { to: NEW_DEST } }),
+    ).rejects.toThrow(/paymentId/);
+    expect(escrow.beneficiarySets).toEqual([]);
+  });
+});
+
 describe("worker registry", () => {
-  it("registers the keeper handlers", () => {
+  it("registers the keeper and redirect handlers", () => {
     expect(handlers["unlock-note"]).toBe(handleUnlockNote);
     expect(handlers["release-scan"]).toBe(handleReleaseScan);
+    expect(handlers["redirect"]).toBe(handleRedirect);
   });
 });

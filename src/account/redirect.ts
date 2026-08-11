@@ -1,14 +1,10 @@
-import { isAddress, type Address, type Hex } from "viem";
+import type { Pool } from "pg";
+import { isAddress, type Address } from "viem";
 import { normalizeEmail } from "../auth/magic.js";
-import {
-  feePaymentId,
-  getEntry,
-  paymentIdBytes32,
-  setBeneficiary,
-  type EscrowClients,
-} from "../chain/escrow.js";
+import { withTransaction } from "../db/index.js";
 import { enqueue } from "../db/jobs.js";
-import type { PaymentRow, Queryable } from "../db/payments.js";
+import type { PaymentRow } from "../db/payments.js";
+import type { RedirectJobPayload } from "../worker/redirect.js";
 
 /**
  * How many destination changes one payment may make in a day. Redirects are
@@ -19,21 +15,24 @@ import type { PaymentRow, Queryable } from "../db/payments.js";
  */
 const MAX_REDIRECTS_PER_DAY = 3;
 
+const UUID_PATTERN =
+  /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/;
+
 export type RedirectErrorCode =
   | "not_found"
   | "forbidden"
   | "invalid_address"
   | "not_redirectable"
-  | "rate_limited"
-  | "fee_leg_failed";
+  | "redirect_pending"
+  | "rate_limited";
 
 const STATUS_BY_CODE: Record<RedirectErrorCode, number> = {
   not_found: 404,
   forbidden: 403,
   invalid_address: 400,
   not_redirectable: 409,
+  redirect_pending: 409,
   rate_limited: 429,
-  fee_leg_failed: 502,
 };
 
 /** A rejection the route maps straight to a status, as opposed to a fault. */
@@ -49,24 +48,8 @@ export class RedirectError extends Error {
   }
 }
 
-/** The two escrow operations a redirect makes. */
-export interface RedirectEscrow {
-  hasEntry(paymentId: Hex): Promise<boolean>;
-  setBeneficiary(paymentId: Hex, to: Address): Promise<Hex>;
-}
-
-/** The live implementation, bound to a viem client pair. */
-export function liveRedirectEscrow(clients: EscrowClients): RedirectEscrow {
-  return {
-    hasEntry: async (paymentId) => (await getEntry(clients, paymentId)) !== null,
-    setBeneficiary: async (paymentId, to) =>
-      (await setBeneficiary(clients, { paymentId, to })).txHash,
-  };
-}
-
 export interface RedirectDeps {
-  pool: Queryable;
-  escrow: RedirectEscrow;
+  pool: Pool;
 }
 
 export interface RedirectInput {
@@ -77,28 +60,35 @@ export interface RedirectInput {
 }
 
 export interface RedirectResult {
-  txHash: Hex;
-  /** Present only when the payment had a fee leg to move as well. */
-  feeTxHash?: Hex;
-}
-
-/** Payload of the `redirect-email` job. Task 9's mailer consumes it. */
-export interface RedirectEmailJobPayload {
-  paymentId: string;
-  toAddress: string;
+  status: "pending";
+  /** The audit row that reserved this redirect's daily slot. */
+  redirectId: string;
+  jobId: string;
 }
 
 /**
- * Points a payment's escrowed tokens at a different address.
+ * Accepts a request to point a payment's escrowed tokens at a different
+ * address, and hands the onchain work to the worker.
  *
- * Every gate runs before anything is sent, because a `setBeneficiary` can't be
- * taken back -- only superseded, and only after the contract's 48h delay. The
- * legs are ordered donation-first: a payer who supplies a new address cares
- * about the donation tokens, and a fee leg that fails afterwards leaves the
- * thing they asked for done. That is also why a fee-leg failure still leaves
- * the donation redirect recorded (and reported as a 502): the row must reflect
- * what is actually onchain, or the account page would show the old address
- * while the escrow points at the new one.
+ * The web process never signs. `setBeneficiary` is an operator-only call on
+ * the escrow, and the operator can also `forfeit` -- so the key lives with the
+ * worker, and this function's whole job is to decide whether the redirect is
+ * allowed and then enqueue it. The caller gets a 202-shaped answer, not a
+ * transaction hash.
+ *
+ * Everything happens in one transaction that starts by locking the payment
+ * row, because all three gates -- state, "no redirect already in flight", and
+ * the daily ceiling -- are read-then-act checks that a concurrent request
+ * would otherwise slip between. With the lock, requests for the same payment
+ * queue up and each one sees the previous one's committed effects. The daily
+ * ceiling is additionally written as its own gate: the audit row is inserted
+ * by a statement that only inserts when the count is still under the limit, so
+ * even without the lock the ceiling could not be exceeded by a race.
+ *
+ * The slot is claimed *before* the send is scheduled, so a redirect that
+ * fails onchain still costs its slot. That is the deliberate direction to err
+ * in: the alternative is a failed send that costs nothing and can be retried
+ * without limit.
  */
 export async function requestRedirect(
   deps: RedirectDeps,
@@ -109,86 +99,81 @@ export async function requestRedirect(
   }
   const destination: Address = input.address;
 
-  const payment = await loadPayment(deps.pool, input.paymentId);
-  if (!payment) {
+  if (!UUID_PATTERN.test(input.paymentId)) {
     throw new RedirectError("not_found", `no payment with id ${input.paymentId}`);
   }
-  if (normalizeEmail(payment.email) !== normalizeEmail(input.sessionEmail)) {
-    throw new RedirectError("forbidden", `payment ${payment.id} belongs to another payer`);
-  }
-  if (
-    (payment.state !== "held" && payment.state !== "unlocked") ||
-    payment.release_tx !== null
-  ) {
-    throw new RedirectError(
-      "not_redirectable",
-      `payment ${payment.id} is '${payment.state}' and cannot be redirected`,
+
+  return withTransaction(deps.pool, async (db) => {
+    const { rows } = await db.query<PaymentRow>(
+      "SELECT * FROM payments WHERE id = $1 FOR UPDATE",
+      [input.paymentId],
     );
-  }
-
-  const { rows: counted } = await deps.pool.query<{ n: number }>(
-    `SELECT count(*)::int AS n FROM redirects
-      WHERE payment_id = $1 AND created_at > now() - interval '1 day'`,
-    [payment.id],
-  );
-  if ((counted[0]?.n ?? 0) >= MAX_REDIRECTS_PER_DAY) {
-    throw new RedirectError(
-      "rate_limited",
-      `payment ${payment.id} has already been redirected ${MAX_REDIRECTS_PER_DAY} times today`,
-    );
-  }
-
-  const escrowPaymentId = paymentIdBytes32(payment.id);
-  const txHash = await deps.escrow.setBeneficiary(escrowPaymentId, destination);
-
-  // One statement, so the audit row and the destination can never disagree:
-  // the rate limit counts the audit rows, and the account page reads the
-  // destination.
-  const { rows: recorded } = await deps.pool.query<{ id: string }>(
-    `WITH audit AS (
-       INSERT INTO redirects (payment_id, to_address) VALUES ($1, $2) RETURNING id
-     ), updated AS (
-       UPDATE payments SET claim_address = $2, updated_at = now() WHERE id = $1
-     )
-     SELECT id FROM audit`,
-    [payment.id, destination],
-  );
-  const auditId = recorded[0]?.id;
-
-  const feeId = feePaymentId(escrowPaymentId);
-  let feeTxHash: Hex | undefined;
-  if (await deps.escrow.hasEntry(feeId)) {
-    try {
-      feeTxHash = await deps.escrow.setBeneficiary(feeId, destination);
-    } catch (err) {
+    const payment = rows[0];
+    if (!payment) {
+      throw new RedirectError("not_found", `no payment with id ${input.paymentId}`);
+    }
+    if (normalizeEmail(payment.email) !== normalizeEmail(input.sessionEmail)) {
+      throw new RedirectError("forbidden", `payment ${payment.id} belongs to another payer`);
+    }
+    if (!isRedirectable(payment)) {
       throw new RedirectError(
-        "fee_leg_failed",
-        `payment ${payment.id}: donation redirect landed, fee leg did not: ${
-          err instanceof Error ? err.message : String(err)
-        }`,
+        "not_redirectable",
+        `payment ${payment.id} is '${payment.state}' and cannot be redirected`,
       );
     }
-  }
 
-  const payload: RedirectEmailJobPayload = {
-    paymentId: payment.id,
-    toAddress: destination,
-  };
-  await enqueue(deps.pool, "redirect-email", payload, {
-    // Keyed on the audit row, not the payment: a payer who moves their tokens
-    // twice is owed two confirmations.
-    dedupeKey: auditId ? `redirect-email:${auditId}` : undefined,
+    const pending = await db.query(
+      `SELECT 1 FROM jobs
+        WHERE kind = 'redirect' AND done_at IS NULL AND payload->>'paymentId' = $1
+        LIMIT 1`,
+      [payment.id],
+    );
+    if (pending.rowCount) {
+      throw new RedirectError(
+        "redirect_pending",
+        `payment ${payment.id} already has a redirect in flight`,
+      );
+    }
+
+    // The gate and the write are the same statement: no row comes back when
+    // the payment moved out of a redirectable state or the daily ceiling is
+    // already reached, and there is no window between deciding and recording.
+    const claimed = await db.query<{ id: string }>(
+      `INSERT INTO redirects (payment_id, to_address)
+       SELECT p.id, $2 FROM payments p
+        WHERE p.id = $1
+          AND p.state IN ('held', 'unlocked')
+          AND p.release_tx IS NULL
+          AND (
+            SELECT count(*) FROM redirects r
+             WHERE r.payment_id = p.id AND r.created_at > now() - interval '1 day'
+          ) < $3
+       RETURNING id`,
+      [payment.id, destination, MAX_REDIRECTS_PER_DAY],
+    );
+    const redirectId = claimed.rows[0]?.id;
+    if (!redirectId) {
+      throw new RedirectError(
+        "rate_limited",
+        `payment ${payment.id} has already been redirected ${MAX_REDIRECTS_PER_DAY} times today`,
+      );
+    }
+
+    const payload: RedirectJobPayload = { paymentId: payment.id, to: destination };
+    // Keyed on the audit row rather than the payment: this queue keeps a
+    // dedupe key after a job completes, so a payment-scoped key would make a
+    // payer's second redirect permanently unschedulable. "Only one in flight"
+    // is enforced by the pending check above instead.
+    const job = await enqueue(db, "redirect", payload, {
+      dedupeKey: `redirect:${redirectId}`,
+    });
+
+    return { status: "pending", redirectId, jobId: job.id };
   });
-
-  return feeTxHash ? { txHash, feeTxHash } : { txHash };
 }
 
-async function loadPayment(db: Queryable, id: string): Promise<PaymentRow | null> {
-  if (
-    !/^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(id)
-  ) {
-    return null;
-  }
-  const { rows } = await db.query<PaymentRow>("SELECT * FROM payments WHERE id = $1", [id]);
-  return rows[0] ?? null;
+function isRedirectable(payment: PaymentRow): boolean {
+  return (
+    (payment.state === "held" || payment.state === "unlocked") && payment.release_tx === null
+  );
 }

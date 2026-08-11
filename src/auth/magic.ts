@@ -1,4 +1,4 @@
-import { createHash, createHmac, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import type { Queryable } from "../db/payments.js";
 import { requireEnv } from "../env.js";
 
@@ -66,12 +66,10 @@ export function isEmailish(email: string): boolean {
 }
 
 function randomNonce(): string {
-  // 16 bytes of entropy: enough that two tokens issued in the same second for
-  // the same email are still distinct values (and distinct `used_tokens` rows).
-  return createHash("sha256")
-    .update(`${Date.now()}:${Math.random()}:${process.pid}`)
-    .digest("base64url")
-    .slice(0, 22);
+  // 16 CSPRNG bytes: enough that two tokens issued in the same second for the
+  // same email are still distinct values (and distinct `used_tokens` rows),
+  // and unguessable even to someone who knows exactly when a link was minted.
+  return randomBytes(16).toString("base64url");
 }
 
 /**
@@ -143,7 +141,12 @@ export async function verifyToken(
   if (!macEquals(parsed.signature, expected)) return null;
   if (parsed.exp * 1000 <= now) return null;
 
-  const hash = createHash("sha256").update(token).digest("hex");
+  // Hash the DECODED payload, never the string that arrived. base64url is
+  // malleable -- `token`, `token=`, `token==` and a token with a stray newline
+  // all decode to the same bytes -- so hashing the raw string would file each
+  // variant under its own `used_tokens` row and let a spent link be replayed
+  // by appending a character.
+  const hash = createHash("sha256").update(decoded, "utf8").digest("hex");
   const result = await db.query(
     "INSERT INTO used_tokens (hash) VALUES ($1) ON CONFLICT (hash) DO NOTHING",
     [hash],
@@ -170,6 +173,23 @@ export function makeSessionCookie(email: string, options: SessionOptions = {}): 
   return `${body}|${mac(SESSION_DOMAIN, body, authSecret(options.secret))}`;
 }
 
+/**
+ * The cookie value is percent-encoded on the way out (it contains `|` and the
+ * payer's `@`, and only a subset of octets is legal in a cookie), so it has to
+ * be decoded on the way back in. Nothing here decodes the value itself --
+ * `next/headers` and a raw `Cookie` header both hand back exactly what the
+ * browser sent -- and a value that isn't valid percent-encoding is used as-is
+ * rather than throwing, so an old unencoded cookie still verifies.
+ */
+function decodeCookieValue(raw: string): string {
+  if (!raw.includes("%")) return raw;
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return raw;
+  }
+}
+
 /** Returns the session's email, or null when the cookie is missing, forged or expired. */
 export function readSession(
   cookieValue: string | null | undefined,
@@ -178,7 +198,7 @@ export function readSession(
   const now = options.now?.() ?? Date.now();
   if (!cookieValue) return null;
 
-  const parsed = splitSigned(cookieValue);
+  const parsed = splitSigned(decodeCookieValue(cookieValue));
   if (!parsed) return null;
 
   const expected = mac(SESSION_DOMAIN, parsed.body, authSecret(options.secret));
@@ -214,7 +234,7 @@ export function sessionCookieAttributes(maxAgeSeconds: number): string {
 /** The full `Set-Cookie` header value that logs `email` in. */
 export function sessionSetCookie(email: string, options: SessionOptions = {}): string {
   const ttlDays = options.ttlDays ?? DEFAULT_SESSION_TTL_DAYS;
-  const value = makeSessionCookie(email, options);
+  const value = encodeURIComponent(makeSessionCookie(email, options));
   return `${SESSION_COOKIE_NAME}=${value}; ${sessionCookieAttributes(ttlDays * 24 * 60 * 60)}`;
 }
 

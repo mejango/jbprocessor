@@ -24,10 +24,8 @@ const REDIRECT_ERRORS: Record<string, string> = {
   forbidden: "That donation belongs to a different account.",
   not_found: "We could not find that donation.",
   not_redirectable: "That donation can no longer be redirected.",
+  redirect_pending: "That donation already has a destination change on its way onchain.",
   rate_limited: "That donation has already been redirected three times today. Try tomorrow.",
-  fee_leg_failed:
-    "The donation was redirected, but the service fee leg did not go through. We are on it.",
-  redirect_unavailable: "Redirects are not available right now.",
   unauthorized: "Your session expired. Sign in again.",
 };
 
@@ -51,8 +49,9 @@ export default async function AccountPage({ searchParams }: AccountPageProps) {
 
       {redirected ? (
         <p className="notice">
-          Destination updated. The change takes effect onchain 48 hours from now, and your
-          tokens are delivered to the new address after that.
+          Destination change queued. We send it onchain within a few minutes, and it takes
+          effect 48 hours after that -- your tokens are delivered to the new address once the
+          wait is over.
         </p>
       ) : null}
       {error ? (
@@ -121,7 +120,20 @@ function PaymentCard({
           <span className="label">Destination</span>
           <span className="value mono">{payment.destination ?? "--"}</span>
         </span>
+        {payment.pendingDestination ? (
+          <span className="field">
+            <span className="label">Change queued</span>
+            <span className="value mono">{payment.pendingDestination}</span>
+          </span>
+        ) : null}
       </div>
+
+      {payment.pendingDestination ? (
+        <p className="muted">
+          This change is on its way onchain. It takes effect 48 hours after we send it, and
+          you can queue another change once it has gone through.
+        </p>
+      ) : null}
 
       {goesToPregenWallet ? (
         <p className="muted">

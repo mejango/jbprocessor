@@ -1,8 +1,7 @@
 import { createHash } from "node:crypto";
 import { Pool } from "pg";
-import type { Address, Hex } from "viem";
-import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { feePaymentId, paymentIdBytes32 } from "../src/chain/escrow.js";
+import type { Address } from "viem";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { migrate } from "../src/db/index.js";
 import { createPayment, type PaymentState } from "../src/db/payments.js";
 import {
@@ -14,7 +13,7 @@ import {
 } from "../src/auth/magic.js";
 import { getOrCreatePregenWallet, type ParaClient } from "../src/wallets/para.js";
 import { requestMagicLink, completeLogin } from "../src/account/login.js";
-import { requestRedirect, RedirectError, type RedirectEscrow } from "../src/account/redirect.js";
+import { requestRedirect, RedirectError } from "../src/account/redirect.js";
 import { listAccountPayments, publicPaymentView } from "../src/account/payments.js";
 
 const TEST_DATABASE_URL =
@@ -88,13 +87,15 @@ describe("signToken / verifyToken", () => {
     await expect(verifyToken(pool, token, { now: at(T0) })).resolves.toBeNull();
   });
 
-  it("stores only the token's hash, never the token itself", async () => {
+  it("stores only a hash of the canonical payload, never the token itself", async () => {
     const token = signToken("hashed@example.com", 15, { now: at(T0) });
     await verifyToken(pool, token, { now: at(T0) });
     const { rows } = await pool.query<{ hash: string }>("SELECT hash FROM used_tokens");
-    const hash = createHash("sha256").update(token).digest("hex");
+    const canonical = Buffer.from(token, "base64url").toString("utf8");
+    const hash = createHash("sha256").update(canonical, "utf8").digest("hex");
     expect(rows.map((row) => row.hash)).toContain(hash);
     expect(rows.map((row) => row.hash)).not.toContain(token);
+    expect(rows.map((row) => row.hash)).not.toContain(canonical);
   });
 
   it("rejects a tampered payload", async () => {
@@ -110,6 +111,18 @@ describe("signToken / verifyToken", () => {
   it("rejects a token signed with a different secret", async () => {
     const token = signToken("other@example.com", 15, { now: at(T0), secret: "some-other-secret" });
     await expect(verifyToken(pool, token, { now: at(T0) })).resolves.toBeNull();
+  });
+
+  it("cannot be replayed by re-encoding it: base64url padding is not a new token", async () => {
+    const token = signToken("malleable@example.com", 15, { now: at(T0) });
+    await expect(verifyToken(pool, token, { now: at(T0) })).resolves.toBe(
+      "malleable@example.com",
+    );
+
+    // All of these decode to the same bytes as the spent token.
+    for (const variant of [`${token}=`, `${token}==`, `${token}\n`, `${token}A`]) {
+      await expect(verifyToken(pool, variant, { now: at(T0) })).resolves.toBeNull();
+    }
   });
 
   it("rejects garbage without touching the used-token table", async () => {
@@ -219,6 +232,25 @@ describe("requestMagicLink / completeLogin", () => {
     await expect(completeLogin({ pool }, "garbage", { now: at(T0) })).resolves.toBeNull();
   });
 
+  it("sends at most one link per address per minute", async () => {
+    await requestMagicLink({ pool }, "flood@example.com", { now: at(T0) });
+    await requestMagicLink({ pool }, "FLOOD@example.com", { now: at(T0 + 30_000) });
+
+    const within = await pool.query<{ n: number }>(
+      "SELECT count(*)::int AS n FROM jobs WHERE kind = 'magic-link-email' AND payload->>'email' = $1",
+      ["flood@example.com"],
+    );
+    expect(within.rows[0]!.n).toBe(1);
+
+    // The next minute is a fresh bucket: a payer who waited gets another link.
+    await requestMagicLink({ pool }, "flood@example.com", { now: at(T0 + 61_000) });
+    const later = await pool.query<{ n: number }>(
+      "SELECT count(*)::int AS n FROM jobs WHERE kind = 'magic-link-email' AND payload->>'email' = $1",
+      ["flood@example.com"],
+    );
+    expect(later.rows[0]!.n).toBe(2);
+  });
+
   it("does not enqueue anything for a malformed email", async () => {
     const before = await pool.query("SELECT count(*)::int AS n FROM jobs WHERE kind = 'magic-link-email'");
     await requestMagicLink({ pool }, "not-an-email", { now: at(T0) });
@@ -226,26 +258,6 @@ describe("requestMagicLink / completeLogin", () => {
     expect(after.rows[0].n).toBe(before.rows[0].n);
   });
 });
-
-/** Fake of the two escrow operations a redirect makes. */
-class FakeEscrow implements RedirectEscrow {
-  entries = new Set<string>();
-  calls: Array<{ paymentId: Hex; to: Address }> = [];
-  failFor: string | null = null;
-  private counter = 0;
-
-  async hasEntry(paymentId: Hex): Promise<boolean> {
-    return this.entries.has(paymentId);
-  }
-
-  async setBeneficiary(paymentId: Hex, to: Address): Promise<Hex> {
-    if (this.failFor === paymentId) throw new Error("rpc exploded");
-    this.calls.push({ paymentId, to });
-    this.counter += 1;
-    return `0x${this.counter.toString(16).padStart(64, "0")}` as Hex;
-  }
-}
-
 async function seedPayment(
   email: string,
   state: PaymentState,
@@ -273,111 +285,105 @@ async function seedPayment(
   return payment.id;
 }
 
+async function redirectJobs(paymentId: string): Promise<Array<{ id: string; to: string }>> {
+  const { rows } = await pool.query<{ id: string; to: string }>(
+    "SELECT id, payload->>'to' AS to FROM jobs WHERE kind = 'redirect' AND payload->>'paymentId' = $1 ORDER BY id",
+    [paymentId],
+  );
+  return rows;
+}
+
+/** Marks the worker's redirect job finished, as `complete` would. */
+async function finishRedirectJobs(paymentId: string): Promise<void> {
+  await pool.query(
+    "UPDATE jobs SET done_at = now() WHERE kind = 'redirect' AND done_at IS NULL AND payload->>'paymentId' = $1",
+    [paymentId],
+  );
+}
+
+async function auditCount(paymentId: string): Promise<number> {
+  const { rows } = await pool.query<{ n: number }>(
+    "SELECT count(*)::int AS n FROM redirects WHERE payment_id = $1",
+    [paymentId],
+  );
+  return rows[0]!.n;
+}
+
 describe("requestRedirect", () => {
-  let escrow: FakeEscrow;
-
-  beforeEach(() => {
-    escrow = new FakeEscrow();
-  });
-
-  it("sets the beneficiary, records the destination, and enqueues a confirmation", async () => {
+  it("queues the redirect for the worker and reserves a daily slot", async () => {
     const id = await seedPayment("owner@example.com", "held");
     const result = await requestRedirect(
-      { pool, escrow },
+      { pool },
       { paymentId: id, address: DEST, sessionEmail: "owner@example.com" },
     );
 
-    expect(result.txHash).toBeTruthy();
-    expect(escrow.calls).toEqual([{ paymentId: paymentIdBytes32(id), to: DEST }]);
+    expect(result.status).toBe("pending");
+    expect(await redirectJobs(id)).toEqual([{ id: result.jobId, to: DEST }]);
+    expect(await auditCount(id)).toBe(1);
 
+    // The web process signs nothing, so the destination only moves once the
+    // worker has both escrow legs onchain.
     const { rows } = await pool.query<{ claim_address: string }>(
       "SELECT claim_address FROM payments WHERE id = $1",
       [id],
     );
-    expect(rows[0]!.claim_address.toLowerCase()).toBe(DEST.toLowerCase());
-
-    const audit = await pool.query("SELECT * FROM redirects WHERE payment_id = $1", [id]);
-    expect(audit.rowCount).toBe(1);
-
-    const jobs = await pool.query(
-      "SELECT count(*)::int AS n FROM jobs WHERE kind = 'redirect-email' AND payload->>'paymentId' = $1",
-      [id],
-    );
-    expect(jobs.rows[0].n).toBe(1);
+    expect(rows[0]!.claim_address.toLowerCase()).toBe(addr("00a1").toLowerCase());
   });
 
-  it("redirects the fee leg too when the escrow holds one", async () => {
-    const id = await seedPayment("fee@example.com", "held");
-    escrow.entries.add(feePaymentId(paymentIdBytes32(id)));
-
-    const result = await requestRedirect(
-      { pool, escrow },
-      { paymentId: id, address: DEST, sessionEmail: "fee@example.com" },
+  it("refuses a second request while one is still in flight", async () => {
+    const id = await seedPayment("inflight@example.com", "held");
+    await requestRedirect(
+      { pool },
+      { paymentId: id, address: DEST, sessionEmail: "inflight@example.com" },
     );
-
-    expect(result.feeTxHash).toBeTruthy();
-    expect(escrow.calls.map((call) => call.paymentId)).toEqual([
-      paymentIdBytes32(id),
-      feePaymentId(paymentIdBytes32(id)),
-    ]);
-  });
-
-  it("reports a fee-leg failure but keeps the main redirect on record", async () => {
-    const id = await seedPayment("feefail@example.com", "held");
-    const feeId = feePaymentId(paymentIdBytes32(id));
-    escrow.entries.add(feeId);
-    escrow.failFor = feeId;
 
     await expect(
       requestRedirect(
-        { pool, escrow },
-        { paymentId: id, address: DEST, sessionEmail: "feefail@example.com" },
+        { pool },
+        { paymentId: id, address: OTHER_DEST, sessionEmail: "inflight@example.com" },
       ),
-    ).rejects.toMatchObject({ code: "fee_leg_failed", status: 502 });
+    ).rejects.toMatchObject({ code: "redirect_pending", status: 409 });
 
-    const { rows } = await pool.query<{ claim_address: string }>(
-      "SELECT claim_address FROM payments WHERE id = $1",
-      [id],
-    );
-    expect(rows[0]!.claim_address.toLowerCase()).toBe(DEST.toLowerCase());
+    expect(await auditCount(id)).toBe(1);
   });
 
   it("rejects a session email that isn't the payment's", async () => {
     const id = await seedPayment("owner@example.com", "held");
     await expect(
       requestRedirect(
-        { pool, escrow },
+        { pool },
         { paymentId: id, address: DEST, sessionEmail: "someone-else@example.com" },
       ),
     ).rejects.toMatchObject({ code: "forbidden" });
-    expect(escrow.calls).toHaveLength(0);
+    expect(await redirectJobs(id)).toEqual([]);
+    expect(await auditCount(id)).toBe(0);
   });
 
   it("accepts the payment's email in a different case", async () => {
     const id = await seedPayment("Case@Example.com", "unlocked");
     await expect(
       requestRedirect(
-        { pool, escrow },
+        { pool },
         { paymentId: id, address: DEST, sessionEmail: "case@example.com" },
       ),
-    ).resolves.toBeTruthy();
+    ).resolves.toMatchObject({ status: "pending" });
   });
 
   it("rejects a malformed address", async () => {
     const id = await seedPayment("badaddr@example.com", "held");
     await expect(
       requestRedirect(
-        { pool, escrow },
+        { pool },
         { paymentId: id, address: "0xnope", sessionEmail: "badaddr@example.com" },
       ),
     ).rejects.toMatchObject({ code: "invalid_address" });
-    expect(escrow.calls).toHaveLength(0);
+    expect(await auditCount(id)).toBe(0);
   });
 
   it("rejects an unknown payment", async () => {
     await expect(
       requestRedirect(
-        { pool, escrow },
+        { pool },
         {
           paymentId: "00000000-0000-4000-8000-000000000000",
           address: DEST,
@@ -393,18 +399,18 @@ describe("requestRedirect", () => {
     });
     await expect(
       requestRedirect(
-        { pool, escrow },
+        { pool },
         { paymentId: id, address: DEST, sessionEmail: "released@example.com" },
       ),
     ).rejects.toMatchObject({ code: "not_redirectable" });
-    expect(escrow.calls).toHaveLength(0);
+    expect(await redirectJobs(id)).toEqual([]);
   });
 
   it("rejects a payment that hasn't been escrowed yet", async () => {
     const id = await seedPayment("early@example.com", "paid");
     await expect(
       requestRedirect(
-        { pool, escrow },
+        { pool },
         { paymentId: id, address: DEST, sessionEmail: "early@example.com" },
       ),
     ).rejects.toMatchObject({ code: "not_redirectable" });
@@ -414,17 +420,58 @@ describe("requestRedirect", () => {
     const id = await seedPayment("busy@example.com", "held");
     for (const destination of [DEST, OTHER_DEST, DEST]) {
       await requestRedirect(
-        { pool, escrow },
+        { pool },
         { paymentId: id, address: destination, sessionEmail: "busy@example.com" },
       );
+      await finishRedirectJobs(id);
     }
     await expect(
       requestRedirect(
-        { pool, escrow },
+        { pool },
         { paymentId: id, address: OTHER_DEST, sessionEmail: "busy@example.com" },
       ),
     ).rejects.toMatchObject({ code: "rate_limited", status: 429 });
-    expect(escrow.calls).toHaveLength(3);
+    expect(await auditCount(id)).toBe(3);
+  });
+
+  it("holds the ceiling under concurrent requests", async () => {
+    const id = await seedPayment("stampede@example.com", "held");
+
+    const attempts = await Promise.allSettled(
+      Array.from({ length: 6 }, () =>
+        requestRedirect(
+          { pool },
+          { paymentId: id, address: DEST, sessionEmail: "stampede@example.com" },
+        ),
+      ),
+    );
+    const accepted = attempts.filter((attempt) => attempt.status === "fulfilled");
+
+    // Every gate is inside one locked transaction, so a burst produces exactly
+    // one queued redirect -- and never more audit rows than accepted requests.
+    expect(accepted).toHaveLength(1);
+    expect(await auditCount(id)).toBe(1);
+    expect(await redirectJobs(id)).toHaveLength(1);
+  });
+
+  it("never exceeds three slots even when every request races", async () => {
+    const id = await seedPayment("stampede2@example.com", "held");
+
+    // Six waves, each racing three requests, with the in-flight job cleared
+    // between waves: only the daily ceiling is left to hold the line.
+    for (let wave = 0; wave < 6; wave += 1) {
+      await Promise.allSettled(
+        Array.from({ length: 3 }, () =>
+          requestRedirect(
+            { pool },
+            { paymentId: id, address: DEST, sessionEmail: "stampede2@example.com" },
+          ),
+        ),
+      );
+      await finishRedirectJobs(id);
+    }
+
+    expect(await auditCount(id)).toBe(3);
   });
 
   it("ignores redirects older than a day when counting", async () => {
@@ -437,15 +484,16 @@ describe("requestRedirect", () => {
     }
     await expect(
       requestRedirect(
-        { pool, escrow },
+        { pool },
         { paymentId: id, address: DEST, sessionEmail: "yesterday@example.com" },
       ),
-    ).resolves.toBeTruthy();
+    ).resolves.toMatchObject({ status: "pending" });
   });
 
   it("is a RedirectError, so routes can map code -> status", async () => {
-    const error = new RedirectError("not_found", "nope");
-    expect(error.status).toBe(404);
+    expect(new RedirectError("not_found", "nope").status).toBe(404);
+    expect(new RedirectError("redirect_pending", "nope").status).toBe(409);
+    expect(new RedirectError("rate_limited", "nope").status).toBe(429);
   });
 });
 
@@ -496,6 +544,23 @@ describe("listAccountPayments", () => {
     expect(row.unlockInDays).toBeNull();
     expect(row.canRedirect).toBe(false);
     expect(row.releaseTx).toBeTruthy();
+  });
+
+  it("shows a queued destination change and closes the form while it is in flight", async () => {
+    const id = await seedPayment("queued@example.com", "held");
+    await requestRedirect(
+      { pool },
+      { paymentId: id, address: DEST, sessionEmail: "queued@example.com" },
+    );
+
+    const [row] = await listAccountPayments(pool, "queued@example.com", { now: at(T0) });
+    expect(row!.pendingDestination).toBe(DEST);
+    expect(row!.canRedirect).toBe(false);
+
+    await finishRedirectJobs(id);
+    const [after] = await listAccountPayments(pool, "queued@example.com", { now: at(T0) });
+    expect(after!.pendingDestination).toBeNull();
+    expect(after!.canRedirect).toBe(true);
   });
 
   it("returns nothing for an email with no payments", async () => {

@@ -284,7 +284,7 @@ export async function createCheckoutSession(
       },
     ],
     metadata: { payment_id: payment.id },
-    success_url: `${baseUrl}/checkout/success?payment_id=${payment.id}`,
+    success_url: `${baseUrl}/done?payment_id=${payment.id}`,
     cancel_url: `${baseUrl}/checkout/cancel?payment_id=${payment.id}`,
   });
 
