@@ -1,0 +1,16 @@
+{
+  "//": "Compiles src/ to plain Node ESM in dist/, for the worker and the migrate CLI. The web app is built by `next build` instead, from the same sources. Module resolution is inherited unchanged from tsconfig.json so the two builds agree about every import; src/ writes explicit `.js` specifiers, which TypeScript emits verbatim and Node resolves directly.",
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": "dist",
+    "rootDir": "src",
+    "declaration": false,
+    "sourceMap": true,
+    "incremental": false,
+    "jsx": "preserve",
+    "plugins": []
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "contracts", ".next", "app", "test"]
+}

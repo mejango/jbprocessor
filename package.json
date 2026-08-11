@@ -7,7 +7,10 @@
     "test": "vitest run",
     "dev": "next dev --webpack",
     "build": "next build --webpack",
-    "start": "next start"
+    "start": "next start",
+    "build:worker": "tsc -p tsconfig.build.json && node -e \"require('node:fs').cpSync('src/db/migrations','dist/db/migrations',{recursive:true})\"",
+    "worker": "node dist/worker/main.js",
+    "migrate": "node dist/db/migrate-cli.js"
   },
   "keywords": [],
   "author": "",

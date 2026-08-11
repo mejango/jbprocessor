@@ -1,9 +1,12 @@
 import type { Pool } from "pg";
 import { zeroAddress, type Hex } from "viem";
+import { balanceOf } from "../chain/erc20.js";
 import { getEntry, paymentIdBytes32, type EscrowClients, type EscrowEntry } from "../chain/escrow.js";
+import { USDC_ON_BASE } from "../chain/quote.js";
 import { enqueue, type JobRow } from "../db/jobs.js";
 import type { PaymentState } from "../db/payments.js";
 import { sendAlert, type EmailDeps } from "../email/send.js";
+import { envAddress, envBigInt } from "../env.js";
 
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
@@ -40,9 +43,19 @@ const ESCROW_CHECK_LIMIT = 500;
  */
 const CLAIMED_RECHECK_MS = 7 * DAY_MS;
 
-/** The escrow read the reconciler makes. */
+/**
+ * How much USDC may sit idle in the settlement wallet before it's worth
+ * asking why. 100 USDC: high enough that a gas-money float or one rounding
+ * remainder doesn't page anybody, low enough that a single stuck donation
+ * (the smallest thing that leaves real money resting) is visible.
+ */
+const DEFAULT_RESTING_BALANCE_ALERT_WEI = 100_000_000n;
+
+/** The onchain reads the reconciler makes. */
 export interface ReconcileChain {
   getEntry(paymentId: Hex): Promise<EscrowEntry | null>;
+  /** The settlement wallet's own USDC balance, in 6-decimal base units. */
+  settlementUsdcBalance(): Promise<bigint>;
 }
 
 /** One charge, as much of it as the day's totals need. */
@@ -90,9 +103,20 @@ export interface ReconcileDeps extends EmailDeps {
   now?: () => number;
 }
 
-/** The live escrow slice, bound to a viem client pair. */
+/**
+ * The live onchain slice, bound to a viem client pair.
+ *
+ * The balance is read for `WORKER_ADDRESS`, not for the wallet client's own
+ * account: the reconciler runs in the worker, but the address it audits is the
+ * one configured as the settlement wallet, so a deployment whose key and
+ * configured address have drifted apart reports on the address of record.
+ */
 export function liveReconcileChain(clients: Pick<EscrowClients, "publicClient">): ReconcileChain {
-  return { getEntry: (paymentId) => getEntry(clients, paymentId) };
+  return {
+    getEntry: (paymentId) => getEntry(clients, paymentId),
+    settlementUsdcBalance: () =>
+      balanceOf(clients, USDC_ON_BASE, envAddress("WORKER_ADDRESS")),
+  };
 }
 
 /** `2026-08-11`, in UTC. The reconciler has exactly one timezone. */
@@ -382,7 +406,32 @@ async function checkStripeDay(deps: ReconcileDeps, now: number): Promise<string[
 }
 
 /**
- * (e) Yesterday's chargebacks, against what the state machine did about them.
+ * (e) USDC that has stopped moving.
+ *
+ * Money passes *through* the settlement wallet: a default-rail donation lands
+ * there from Stripe and leaves in the same hour that its pay job runs, and an
+ * instant one is drawn from the pool immediately before it is spent. So a
+ * resting balance is not a float -- it is USDC that arrived for a payment
+ * whose on-chain send never happened, or was drawn for one that then refunded.
+ *
+ * The other checks find those payments by name when the ledger knows about
+ * them. This one is the backstop for when it doesn't: a lost draw record, a
+ * manual transfer, a Stripe payout into the wallet with no row behind it at
+ * all. It reports a number, not a payment, because the whole point is that
+ * there may be no row to point at.
+ */
+async function checkRestingBalance(deps: ReconcileDeps): Promise<string[]> {
+  const threshold = envBigInt("RESTING_BALANCE_ALERT_WEI", DEFAULT_RESTING_BALANCE_ALERT_WEI);
+  const balance = await deps.escrow.settlementUsdcBalance();
+  if (balance <= threshold) return [];
+
+  return [
+    `settlement wallet holds ${balance} USDC base units, above the ${threshold} alert threshold -- USDC resting here is money that arrived for a payment whose on-chain send did not happen`,
+  ];
+}
+
+/**
+ * (f) Yesterday's chargebacks, against what the state machine did about them.
  *
  * The webhook's dispute router handles every state it safely can, but it
  * deliberately leaves one alone: a payment in `paying` is mid-send and owned
@@ -451,6 +500,7 @@ export async function handleReconcile(deps: ReconcileDeps, _job: JobRow): Promis
     ...(await runCheck("stuck rows", () => checkStuckRows(deps, now))),
     ...(await runCheck("fatal jobs", () => checkFatalJobs(deps, now))),
     ...(await runCheck("stripe day", () => checkStripeDay(deps, now))),
+    ...(await runCheck("resting balance", () => checkRestingBalance(deps))),
     ...(await runCheck("disputes", () => checkDisputes(deps, now))),
   ];
 

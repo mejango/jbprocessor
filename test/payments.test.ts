@@ -55,6 +55,7 @@ describe("migrate", () => {
       "002_premium.sql",
       "003_pool_draw.sql",
       "004_auth.sql",
+      "005_checkout_attempts.sql",
     ]);
   });
 });

@@ -8,6 +8,9 @@ node_modules/
 .next/
 out/
 
+# Worker build output (tsconfig.build.json)
+dist/
+
 # Foundry (contracts/lib is managed as git submodules)
 contracts/out/
 contracts/cache/

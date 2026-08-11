@@ -58,6 +58,15 @@ class FakeEscrow implements ReconcileChain {
     if (this.throwFor.has(paymentId)) throw new Error("rpc timeout");
     return this.entries.get(paymentId) ?? null;
   }
+
+  /** Default: an empty settlement wallet, i.e. every payment's USDC moved on. */
+  settlementBalance = 0n;
+  settlementBalanceError: Error | null = null;
+
+  async settlementUsdcBalance(): Promise<bigint> {
+    if (this.settlementBalanceError) throw this.settlementBalanceError;
+    return this.settlementBalance;
+  }
 }
 
 class FakeStripe implements ReconcileStripe {
@@ -535,6 +544,46 @@ describe("handleReconcile", () => {
 
     expect(alertText()).toMatch(/rpc timeout/);
     expect(alertText()).toContain(stuck);
+  });
+
+  describe("resting balance", () => {
+    afterEach(() => {
+      delete process.env.RESTING_BALANCE_ALERT_WEI;
+    });
+
+    it("says nothing while the settlement wallet is at or under the threshold", async () => {
+      escrow.settlementBalance = 100_000_000n; // exactly 100 USDC, the default
+
+      await handleReconcile(deps(), RECONCILE_JOB);
+
+      expect(resend.sent).toHaveLength(0);
+    });
+
+    it("reports USDC left resting in the settlement wallet", async () => {
+      escrow.settlementBalance = 250_000_000n; // 250 USDC
+
+      await handleReconcile(deps(), RECONCILE_JOB);
+
+      expect(alertText()).toContain("settlement wallet holds 250000000 USDC base units");
+      expect(alertText()).toContain("100000000 alert threshold");
+    });
+
+    it("honours RESTING_BALANCE_ALERT_WEI", async () => {
+      process.env.RESTING_BALANCE_ALERT_WEI = "500000000"; // 500 USDC
+      escrow.settlementBalance = 250_000_000n;
+
+      await handleReconcile(deps(), RECONCILE_JOB);
+
+      expect(resend.sent).toHaveLength(0);
+    });
+
+    it("reports an unreadable balance rather than passing the day as clean", async () => {
+      escrow.settlementBalanceError = new Error("rpc timeout");
+
+      await handleReconcile(deps(), RECONCILE_JOB);
+
+      expect(alertText()).toContain("check 'resting balance' failed: rpc timeout");
+    });
   });
 });
 
