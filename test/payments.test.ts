@@ -54,6 +54,7 @@ describe("migrate", () => {
       "001_init.sql",
       "002_premium.sql",
       "003_pool_draw.sql",
+      "004_auth.sql",
     ]);
   });
 });

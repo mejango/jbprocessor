@@ -4,20 +4,29 @@ import { getPool } from "../db/index.js";
 import { claimNext, complete, fail, reapStale, type JobRow } from "../db/jobs.js";
 import { requireEnv } from "../env.js";
 import { handlePay, liveChain, type PayDeps } from "./pay.js";
+import {
+  handleReleaseScan,
+  handleUnlockNote,
+  liveReleaseChain,
+  scheduleReleaseScan,
+  type ReleaseDeps,
+} from "./release.js";
 
 /** Everything any handler needs. Later tasks widen this as they add handlers. */
-export type WorkerDeps = PayDeps;
+export type WorkerDeps = PayDeps & ReleaseDeps;
 
 export type JobHandler = (deps: WorkerDeps, job: JobRow) => Promise<void>;
 
 /**
- * Job kind -> handler. `unlock-note`, `receipt-email`, `forfeit`, `release`
- * and the recurring cranks register here as they land. A kind with no handler
- * fails (and eventually goes FATAL) rather than being silently completed --
- * an unregistered kind should be loud, not a quietly dropped payment.
+ * Job kind -> handler. `receipt-email`, `forfeit` and the remaining recurring
+ * cranks register here as they land. A kind with no handler fails (and
+ * eventually goes FATAL) rather than being silently completed -- an
+ * unregistered kind should be loud, not a quietly dropped payment.
  */
 export const handlers: Record<string, JobHandler> = {
   pay: handlePay,
+  "unlock-note": handleUnlockNote,
+  "release-scan": handleReleaseScan,
 };
 
 const IDLE_SLEEP_MS = 2_000;
@@ -55,10 +64,12 @@ export async function runWorkerOnce(
 }
 
 function depsFromEnv(): WorkerDeps {
+  const clients = { publicClient: publicClient(), walletClient: walletClient() };
   return {
     pool: getPool(),
     stripe: new Stripe(requireEnv("STRIPE_SECRET_KEY")),
-    chain: liveChain({ publicClient: publicClient(), walletClient: walletClient() }),
+    chain: liveChain(clients),
+    escrow: liveReleaseChain(clients),
   };
 }
 
@@ -79,6 +90,20 @@ export async function startWorker(deps: WorkerDeps = depsFromEnv()): Promise<voi
   };
   process.on("SIGTERM", stop);
   process.on("SIGINT", stop);
+
+  // The keeper is a self-scheduling chain, so it needs one link to exist
+  // before it can extend itself. Seeding on every boot (deduped to the current
+  // ten-minute bucket) is what makes a deployment that lost its queue -- or a
+  // brand new one -- start cranking without an operator.
+  try {
+    await scheduleReleaseScan(deps.pool, new Date());
+  } catch (err) {
+    console.error(
+      `worker boot: could not seed the release scan: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+  }
 
   // Interruptible idle: a signal during the sleep exits immediately instead of
   // waiting out the full poll interval.

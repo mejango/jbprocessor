@@ -7,8 +7,8 @@ import type { QuoteTokensParams } from "../src/chain/quote.js";
 import { enqueue, claimNext, type JobRow } from "../src/db/jobs.js";
 import { migrate } from "../src/db/index.js";
 import { createPayment, type PaymentState } from "../src/db/payments.js";
-import { handlePay, type PayChain, type PayDeps } from "../src/worker/pay.js";
-import { runWorkerOnce, startWorker } from "../src/worker/index.js";
+import { handlePay, type PayChain } from "../src/worker/pay.js";
+import { runWorkerOnce, startWorker, type WorkerDeps } from "../src/worker/index.js";
 
 const TEST_DATABASE_URL =
   process.env.TEST_DATABASE_URL ?? "postgres://localhost:5432/jbprocessor_test";
@@ -140,8 +140,17 @@ class FakeStripe {
   };
 }
 
-function deps(chain: FakeChain, stripe: FakeStripe): PayDeps {
-  return { pool, stripe, chain } as unknown as PayDeps;
+function deps(chain: FakeChain, stripe: FakeStripe): WorkerDeps {
+  // The keeper's escrow reads are never exercised here (no payment in these
+  // tests reaches `unlocked`), but the worker registry now carries the release
+  // handlers, so the deps have to satisfy their slice too.
+  const escrow = {
+    getEntry: async () => null,
+    release: async () => {
+      throw new Error("release: not expected in the payer tests");
+    },
+  };
+  return { pool, stripe, chain, escrow } as unknown as WorkerDeps;
 }
 
 interface SeedOptions {
