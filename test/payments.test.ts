@@ -58,6 +58,7 @@ describe("migrate", () => {
       "005_checkout_attempts.sql",
       "006_checkout_attempts_prune.sql",
       "007_pool_swept_at.sql",
+      "008_weekly_card_cap.sql",
     ]);
   });
 });

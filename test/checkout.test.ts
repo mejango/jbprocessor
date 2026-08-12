@@ -260,6 +260,64 @@ describe("createCheckoutSession -- card ceiling", () => {
     expect(d.stripe.lastCall.payment_method_options?.card).toBeUndefined();
   });
 
+  it("closes the card rail once the project's weekly card volume hits the cap", async () => {
+    process.env.WEEKLY_CARD_CAP_USD_CENTS = "10000"; // $100/week
+    const d = deps();
+    // $60 of recent card volume, $30 canceled (must not count), $25 pending
+    // card-sized (must count).
+    await pool.query(
+      `INSERT INTO payments (project_id, email, amount_usd_cents, premium_usd_cents, instant, method, state)
+       VALUES ($1, 'a@example.com', 6000, 0, false, 'card', 'held'),
+              ($1, 'b@example.com', 3000, 0, false, 'card', 'canceled'),
+              ($1, 'c@example.com', 2500, 0, false, NULL, 'created')`,
+      [PROJECT_ID],
+    );
+
+    // 6000 + 2500 pending + 2000 requested = 10500 > 10000: bank-only.
+    await createCheckoutSession(d, {
+      projectId: PROJECT_ID,
+      amountUsdCents: 2_000n,
+      email: "over-cap@example.com",
+      instant: false,
+    });
+    expect(d.lastCallMethods()).toEqual(["us_bank_account"]);
+
+    // The over-cap attempt's own pending row counts too (conservative), so
+    // clear it before checking that a smaller amount keeps the card rail open.
+    await pool.query("DELETE FROM payments WHERE email = 'over-cap@example.com'");
+
+    // A smaller amount still fits under the cap: card stays open.
+    await createCheckoutSession(d, {
+      projectId: PROJECT_ID,
+      amountUsdCents: 1_000n,
+      email: "under-cap@example.com",
+      instant: false,
+    });
+    expect(d.lastCallMethods()).toEqual(["card", "us_bank_account"]);
+    delete process.env.WEEKLY_CARD_CAP_USD_CENTS;
+  });
+
+  it("honours a per-project weekly_card_cap_usd_cents override", async () => {
+    process.env.WEEKLY_CARD_CAP_USD_CENTS = "100"; // $1 default would close cards
+    await pool.query(
+      "UPDATE projects SET weekly_card_cap_usd_cents = 1000000 WHERE project_id = $1",
+      [PROJECT_ID],
+    );
+    const d = deps();
+    await createCheckoutSession(d, {
+      projectId: PROJECT_ID,
+      amountUsdCents: 2_500n,
+      email: "trusted@example.com",
+      instant: false,
+    });
+    expect(d.lastCallMethods()).toEqual(["card", "us_bank_account"]);
+    await pool.query(
+      "UPDATE projects SET weekly_card_cap_usd_cents = NULL WHERE project_id = $1",
+      [PROJECT_ID],
+    );
+    delete process.env.WEEKLY_CARD_CAP_USD_CENTS;
+  });
+
   it("honours a CARD_CEILING_USD_CENTS override", async () => {
     process.env.CARD_CEILING_USD_CENTS = "2000";
     const d = deps();

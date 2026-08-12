@@ -100,6 +100,7 @@ Every variable, what it does, and which service needs it, is documented in
 | `PREMIUM_BPS` | web | no | `150` |
 | `PROCESSOR_PROJECT_ID` / `PROCESSOR_TOKEN_ADDRESS` / `PROCESSOR_TERMINAL_ADDRESS` | worker | no (all three or none) | premium accrues in the settlement wallet |
 | `CARD_CEILING_USD_CENTS` | web | no | `50000` |
+| `WEEKLY_CARD_CAP_USD_CENTS` | web | no | `250000` |
 | `BANK_HOLD_DAYS` | web | no | `7` |
 | `DRIFT_TOLERANCE_BPS` | worker | no | `200` |
 | `RESTING_BALANCE_ALERT_USDC` | worker | no | `100000000` |
@@ -384,6 +385,26 @@ Check, in order:
    `project_unquotable`, and it cannot be onboarded.
 5. Read the project's onchain terms as a human. The ruleset watcher will suspend the project if
    they change, so what is being recorded here is the deal as it stands today.
+6. **Score extraction speed during the dispute window.** This service, not the project, eats
+   card chargebacks — but the USDC lands in the project's terminal at pay time. Eligibility is
+   underwriting: the question is how fast value paid in through this service could leave the
+   project while a chargeback can still arrive. Look at:
+   - payout limits and surplus allowances, and *who the payout splits pay*. Funds that can
+     move to an EOA the day they arrive are the laundering shape. An endowment-style config
+     (little or no payout room, value exits only through cash-outs, which the token hold
+     sits on) is the low-risk shape.
+   - `reservedPercent` × token liquidity: reserved tokens mint to the project's split
+     recipients outside our escrow. High reserved percent on a token with a cash-out floor
+     or AMM pool is immediate partial extraction.
+   - pre-held supply: anyone already holding the token can cash out against surplus this
+     service pays in. Small share × cash-out tax usually makes this uneconomic — check that
+     it stays that way.
+   - who the owner is, how old the project is, whether its public face matches its config.
+7. Set the card cap for the trust level. `WEEKLY_CARD_CAP_USD_CENTS` (default $2,500/week)
+   bounds every project; raise `projects.weekly_card_cap_usd_cents` only for projects with
+   review history (e.g. `UPDATE projects SET weekly_card_cap_usd_cents = 2000000 WHERE
+   project_id = 6;` for $20k/week). Over the cap the card rail closes and checkout offers
+   bank transfer only — bank disputes arrive while the donor's tokens are still escrowed.
 
 Then:
 

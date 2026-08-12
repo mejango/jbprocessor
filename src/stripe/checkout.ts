@@ -15,6 +15,7 @@ import type { WalletProvider } from "../wallets/types.js";
 const BPS_DENOMINATOR = 10_000n;
 
 const DEFAULT_CARD_CEILING_USD_CENTS = 50_000n;
+const DEFAULT_WEEKLY_CARD_CAP_USD_CENTS = 250_000n;
 const DEFAULT_PREMIUM_BPS = 150n;
 
 /**
@@ -119,6 +120,7 @@ interface ProjectRow {
   name: string;
   terminal_address: string;
   status: string;
+  weekly_card_cap_usd_cents: string | null;
 }
 
 /**
@@ -185,7 +187,8 @@ export async function createCheckoutSession(
   }
 
   const { rows } = await pool.query<ProjectRow>(
-    "SELECT project_id, name, terminal_address, status FROM projects WHERE project_id = $1",
+    `SELECT project_id, name, terminal_address, status, weekly_card_cap_usd_cents
+     FROM projects WHERE project_id = $1`,
     [projectId],
   );
   const project = rows[0];
@@ -203,7 +206,32 @@ export async function createCheckoutSession(
   // run 120 days and the escrow can't cover an unbounded one, so large
   // donations are bank-only rather than merely held longer.
   const ceiling = envBigInt("CARD_CEILING_USD_CENTS", DEFAULT_CARD_CEILING_USD_CENTS);
-  const cardAllowed = amountUsdCents <= ceiling;
+  let cardAllowed = amountUsdCents <= ceiling;
+
+  // Per-project rolling card cap: the eligibility gate's mechanical backstop.
+  // A card chargeback claws back our money while the project keeps the USDC,
+  // so how much card volume one project can absorb per dispute cycle is an
+  // underwriting decision, not an unbounded default. Over the cap the card
+  // rail closes; bank transfers stay open (their disputes arrive while the
+  // donor's tokens are still held, and the volume is identity-heavy).
+  // Pending rows (method not yet known) count when card-sized: conservative.
+  if (cardAllowed) {
+    const cap =
+      project.weekly_card_cap_usd_cents !== null
+        ? BigInt(project.weekly_card_cap_usd_cents)
+        : envBigInt("WEEKLY_CARD_CAP_USD_CENTS", DEFAULT_WEEKLY_CARD_CAP_USD_CENTS);
+    const { rows: volumeRows } = await pool.query<{ total: string }>(
+      `SELECT COALESCE(SUM(amount_usd_cents + premium_usd_cents), 0)::text AS total
+       FROM payments
+       WHERE project_id = $1
+         AND created_at > now() - interval '7 days'
+         AND state NOT IN ('canceled', 'refunded')
+         AND (method = 'card' OR (method IS NULL AND amount_usd_cents <= $2))`,
+      [projectId, ceiling.toString()],
+    );
+    cardAllowed = BigInt(volumeRows[0]?.total ?? "0") + amountUsdCents <= cap;
+  }
+
   const paymentMethodTypes: Stripe.Checkout.SessionCreateParams.PaymentMethodType[] =
     cardAllowed ? ["card", "us_bank_account"] : ["us_bank_account"];
 
