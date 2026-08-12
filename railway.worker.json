@@ -1,0 +1,13 @@
+{
+  "$schema": "https://railway.com/railway.schema.json",
+  "//": "The WORKER service: the job queue's only runner, and the only process that holds WORKER_PRIVATE_KEY. Exactly one replica -- the queue's claim is a single-row lock so more than one is safe, but a second replica buys nothing and doubles the RPC bill. Migrations run here, in the one process that is single-instance by design.",
+  "build": {
+    "builder": "NIXPACKS",
+    "buildCommand": "npm run build:worker"
+  },
+  "deploy": {
+    "startCommand": "npm run migrate && npm run worker",
+    "numReplicas": 1,
+    "restartPolicyType": "ALWAYS"
+  }
+}

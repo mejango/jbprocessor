@@ -28,7 +28,8 @@
   "exclude": [
     "node_modules",
     "contracts",
-    ".next"
+    ".next",
+    "dist"
   ],
   "include": [
     "next-env.d.ts",
