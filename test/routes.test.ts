@@ -329,6 +329,30 @@ describe("POST /api/checkout", () => {
     expect(spoofed.status).toBe(429);
   });
 
+  it("frees the budget once the window has passed, and keeps no expired rows", async () => {
+    const ip = freshIp();
+    for (let i = 0; i < 10; i += 1) {
+      expect(await recordCheckoutAttempt(pool, ip)).toBe(true);
+    }
+    expect(await recordCheckoutAttempt(pool, ip)).toBe(false);
+
+    // Age every one of them out of the window.
+    await pool.query(
+      "UPDATE checkout_attempts SET created_at = now() - interval '2 minutes' WHERE ip = $1",
+      [ip],
+    );
+
+    expect(await recordCheckoutAttempt(pool, ip)).toBe(true);
+
+    // The expired rows are gone, not merely uncounted: this table is bounded
+    // by the limiter itself, with no sweeper behind it.
+    const { rows } = await pool.query<{ n: string }>(
+      "SELECT count(*)::text AS n FROM checkout_attempts WHERE ip = $1",
+      [ip],
+    );
+    expect(rows[0]?.n).toBe("1");
+  });
+
   it("charges a malformed request its rate-limit slot", async () => {
     const ip = freshIp();
     const garbage = await handleCheckoutRequest(checkoutDeps(), checkoutRequest({}, { ip }));

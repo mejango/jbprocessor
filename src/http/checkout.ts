@@ -76,8 +76,21 @@ export function clientIp(request: Request): string {
  * The count and the write are one statement, exactly like the redirect
  * limiter: there is no window between deciding and recording, so N concurrent
  * requests from one address can't all read "9 so far" and all proceed.
+ *
+ * Each call also drops its own address's expired rows, which is what keeps
+ * this table bounded without a sweeper: a row outside the window can never
+ * affect the gate again, so the only rows that survive are the ones a live
+ * limit is counting -- at most `MAX_ATTEMPTS_PER_MINUTE` per address that has
+ * been seen in the last minute. Deleting first also makes the count below
+ * cheaper. There is no race to lose: removing rows the gate would have
+ * ignored cannot change its answer.
  */
 export async function recordCheckoutAttempt(pool: Queryable, ip: string): Promise<boolean> {
+  await pool.query(
+    "DELETE FROM checkout_attempts WHERE ip = $1 AND created_at <= now() - interval '1 minute'",
+    [ip],
+  );
+
   const { rows } = await pool.query<{ id: string }>(
     `INSERT INTO checkout_attempts (ip)
      SELECT $1
