@@ -155,6 +155,13 @@ export async function handleCheckoutRequest(
         { status: STATUS_BY_CHECKOUT_CODE[err.code] },
       );
     }
+    // A donor clicking the hosted form shouldn't see a bare 500 because this
+    // environment is missing its Stripe/Para configuration. JSON callers
+    // still get the throw -- integrators want the real error.
+    if (isForm && err instanceof Error && / environment variable is not set$/.test(err.message)) {
+      console.error(`checkout unavailable: ${err.message}`);
+      return formErrorRedirect("not_configured");
+    }
     throw err;
   }
 }
@@ -166,6 +173,23 @@ export async function handleCheckoutRequest(
  * which never signs anything -- the quote is a read, and the beneficiary comes
  * from Para. The escrow operator key lives only in the worker.
  */
+/**
+ * The response for an environment that cannot build its live deps (missing
+ * Stripe/Para configuration). The donate form gets a friendly bounce; JSON
+ * callers get a 503 naming the problem class without leaking which variable.
+ */
+export async function unconfiguredResponse(request: Request, err: unknown): Promise<Response> {
+  console.error(`checkout unavailable: ${err instanceof Error ? err.message : String(err)}`);
+  const { fields, isForm } = await readRequestFields(request);
+  if (isForm) {
+    const back = new URL(`/donate/${fields.projectId ?? ""}`, request.url);
+    back.searchParams.set("error", "not_configured");
+    if (fields.amountUsd) back.searchParams.set("amount", fields.amountUsd);
+    return Response.redirect(back, 303);
+  }
+  return Response.json({ error: "not_configured" }, { status: 503 });
+}
+
 export function liveCheckoutDeps(): CheckoutRouteDeps {
   const pool = getPool();
   return {

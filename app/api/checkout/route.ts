@@ -1,4 +1,9 @@
-import { handleCheckoutRequest, liveCheckoutDeps } from "../../../src/http/checkout.js";
+import {
+  handleCheckoutRequest,
+  liveCheckoutDeps,
+  unconfiguredResponse,
+  type CheckoutRouteDeps,
+} from "../../../src/http/checkout.js";
 
 /**
  * Starts a donation: `{projectId, amountUsd, email, instant?, walletAddress?}`
@@ -10,5 +15,11 @@ import { handleCheckoutRequest, liveCheckoutDeps } from "../../../src/http/check
  * only the binding to the live Stripe/Para/RPC clients.
  */
 export async function POST(request: Request): Promise<Response> {
-  return handleCheckoutRequest(liveCheckoutDeps(), request);
+  let deps: CheckoutRouteDeps;
+  try {
+    deps = liveCheckoutDeps();
+  } catch (err) {
+    return unconfiguredResponse(request, err);
+  }
+  return handleCheckoutRequest(deps, request);
 }

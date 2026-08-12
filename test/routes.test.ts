@@ -764,3 +764,36 @@ describe("POST /api/checkout (form branch, the /donate page)", () => {
     expect(((await response.json()) as { error: string }).error).toBe("project_suspended");
   });
 });
+
+describe("POST /api/checkout (unconfigured environment)", () => {
+  it("bounces a form post back to the donate page with not_configured", async () => {
+    const { unconfiguredResponse } = await import("../src/http/checkout.js");
+    const response = await unconfiguredResponse(
+      checkoutRequest(
+        { projectId: PROJECT_ID, amountUsd: "10", email: "payer@example.com" },
+        { ip: freshIp(), form: true },
+      ),
+      new Error("STRIPE_SECRET_KEY environment variable is not set"),
+    );
+    expect(response.status).toBe(303);
+    const location = new URL(response.headers.get("location") ?? "");
+    expect(location.pathname).toBe(`/donate/${PROJECT_ID}`);
+    expect(location.searchParams.get("error")).toBe("not_configured");
+    expect(location.searchParams.get("amount")).toBe("10");
+  });
+
+  it("answers a JSON caller with a 503 that names no variable", async () => {
+    const { unconfiguredResponse } = await import("../src/http/checkout.js");
+    const response = await unconfiguredResponse(
+      checkoutRequest(
+        { projectId: PROJECT_ID, amountUsd: 10, email: "payer@example.com" },
+        { ip: freshIp() },
+      ),
+      new Error("STRIPE_SECRET_KEY environment variable is not set"),
+    );
+    expect(response.status).toBe(503);
+    const body = (await response.json()) as { error: string };
+    expect(body.error).toBe("not_configured");
+    expect(JSON.stringify(body)).not.toContain("STRIPE_SECRET_KEY");
+  });
+});

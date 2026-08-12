@@ -16,6 +16,8 @@ const ERROR_COPY: Record<string, string> = {
   insufficient_pool_headroom:
     "Instant processing is at capacity right now. Uncheck instant and your donation will process on the normal schedule.",
   rate_limited: "Too many attempts. Wait a minute and try again.",
+  not_configured:
+    "Payments are not configured in this environment yet, so checkout cannot start. Everything before this point worked.",
 };
 
 /**
