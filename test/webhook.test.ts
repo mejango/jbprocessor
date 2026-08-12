@@ -483,6 +483,60 @@ describe("handleStripeEvent -- async bank debits", () => {
     expect(runAt).toBeLessThan(Date.now() + 60_000);
   });
 
+  it("re-anchors the hold when the debit clears, days after it was submitted", async () => {
+    const payment = await newPayment("ach-slow@example.com");
+    const stub = new PaymentIntentStub();
+    stub.intent = paymentIntent("us_bank_account", Math.floor(Date.now() / 1000));
+
+    await handleStripeEvent(
+      deps(stub),
+      signedEvent(
+        "checkout.session.completed",
+        completedSession(payment.id, { payment_status: "unpaid" }),
+      ),
+    );
+
+    // The debit took four days to clear, which is the whole point: the hold
+    // has to outlast the window that starts when the money lands, not the one
+    // that started when the payer submitted the debit.
+    const submitted = new Date(Date.now() - 4 * DAY_MS + 7 * DAY_MS);
+    await pool.query("UPDATE payments SET unlock_at = $2 WHERE id = $1", [
+      payment.id,
+      submitted,
+    ]);
+
+    await handleStripeEvent(
+      deps(stub),
+      signedEvent(
+        "checkout.session.async_payment_succeeded",
+        completedSession(payment.id, { payment_status: "paid" }),
+      ),
+    );
+
+    const row = await readPayment(payment.id);
+    expect(row.state).toBe("paid");
+    const unlockAt = new Date(row.unlock_at as unknown as string).getTime();
+    expect(unlockAt).toBeGreaterThan(submitted.getTime());
+    expect(unlockAt).toBeGreaterThan(Date.now() + 6.9 * DAY_MS);
+    expect(unlockAt).toBeLessThan(Date.now() + 7.1 * DAY_MS);
+  });
+
+  it("leaves a card payment's 120-day hold exactly where 'completed' put it", async () => {
+    const payment = await newPayment("card-hold@example.com");
+    const stub = new PaymentIntentStub();
+    stub.intent = paymentIntent("card", Math.floor(Date.now() / 1000));
+
+    await handleStripeEvent(
+      deps(stub),
+      signedEvent("checkout.session.completed", completedSession(payment.id)),
+    );
+
+    const unlockAt = new Date(
+      (await readPayment(payment.id)).unlock_at as unknown as string,
+    ).getTime();
+    expect(unlockAt).toBeGreaterThan(Date.now() + 119 * DAY_MS);
+  });
+
   it("cancels the payment when the debit fails", async () => {
     const payment = await newPayment("ach-fail@example.com");
     const stub = new PaymentIntentStub();
@@ -671,7 +725,7 @@ describe("handleStripeEvent -- charge.refunded", () => {
     expect((await readPayment(payment.id)).state).toBe("refunded");
   });
 
-  it("is a no-op when the payment has already moved past 'paid'", async () => {
+  it("alerts instead of silently double-giving when the tokens are escrowed", async () => {
     const payment = await newPayment("late-refund@example.com", {
       state: "held",
       paymentIntent: "pi_refund_2",
@@ -689,6 +743,61 @@ describe("handleStripeEvent -- charge.refunded", () => {
       ),
     ).resolves.toBeUndefined();
 
+    // No auto-forfeit and no state change: a refund on a held payment can be
+    // the right call, and clawing a payer's tokens back off a webhook is not.
     expect((await readPayment(payment.id)).state).toBe("held");
+
+    const jobs = await readJobs(`ops-alert:refund:${payment.id}`);
+    expect(jobs).toHaveLength(1);
+    expect(jobs[0]?.kind).toBe("ops-alert");
+    const payload = jobs[0]?.payload as { subject: string; text: string };
+    expect(payload.subject).toMatch(/refund/i);
+    expect(payload.text).toContain(payment.id);
+    expect(payload.text).toContain("held");
+    expect(payload.text).toMatch(/forfeit it/i);
+  });
+
+  it("alerts on a refund for tokens already delivered, and says they are gone", async () => {
+    const payment = await newPayment("gone-refund@example.com", {
+      state: "claimed",
+      paymentIntent: "pi_refund_3",
+    });
+
+    await handleStripeEvent(
+      deps(),
+      signedEvent("charge.refunded", {
+        id: "ch_r3",
+        object: "charge",
+        payment_intent: "pi_refund_3",
+        refunded: true,
+      }),
+    );
+
+    expect((await readPayment(payment.id)).state).toBe("claimed");
+    const jobs = await readJobs(`ops-alert:refund:${payment.id}`);
+    expect(jobs).toHaveLength(1);
+    expect((jobs[0]?.payload as { text: string }).text).toMatch(
+      /nothing[\s\S]*left to forfeit/i,
+    );
+  });
+
+  it("does not alert for a refund on a payment nothing was bought for", async () => {
+    const payment = await newPayment("early-refund@example.com", {
+      state: "paid",
+      paymentIntent: "pi_refund_4",
+    });
+
+    await handleStripeEvent(
+      deps(),
+      signedEvent("charge.refunded", {
+        id: "ch_r4",
+        object: "charge",
+        payment_intent: "pi_refund_4",
+        refunded: true,
+      }),
+    );
+
+    expect((await readPayment(payment.id)).state).toBe("refunded");
+    expect(await readJobs(`ops-alert:refund:${payment.id}`)).toHaveLength(0);
   });
 });

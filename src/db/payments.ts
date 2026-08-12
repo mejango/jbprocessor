@@ -40,6 +40,8 @@ export interface PaymentRow {
   release_tx: string | null;
   /** Set once the worker has drawn this payment's USDC from the instant pool. */
   pool_draw_tx: string | null;
+  /** Set by hand once that draw has been swept back to the pool. */
+  pool_swept_at: Date | null;
   created_at: Date;
   updated_at: Date;
 }

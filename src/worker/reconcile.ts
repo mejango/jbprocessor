@@ -1,8 +1,14 @@
 import type { Pool } from "pg";
 import { zeroAddress, type Hex } from "viem";
 import { balanceOf } from "../chain/erc20.js";
-import { getEntry, paymentIdBytes32, type EscrowClients, type EscrowEntry } from "../chain/escrow.js";
-import { USDC_ON_BASE } from "../chain/quote.js";
+import {
+  feePaymentId,
+  getEntry,
+  paymentIdBytes32,
+  type EscrowClients,
+  type EscrowEntry,
+} from "../chain/escrow.js";
+import { USDC_ON_BASE, USDC_WEI_PER_CENT } from "../chain/quote.js";
 import { enqueue, type JobRow } from "../db/jobs.js";
 import type { PaymentState } from "../db/payments.js";
 import { sendAlert, type EmailDeps } from "../email/send.js";
@@ -154,6 +160,7 @@ interface EscrowCheckRow {
   state: PaymentState;
   tokens_held: string | null;
   claim_address: string | null;
+  instant: boolean;
 }
 
 /**
@@ -169,7 +176,7 @@ interface EscrowCheckRow {
 async function checkEscrowEntries(deps: ReconcileDeps, now: number): Promise<string[]> {
   const lines: string[] = [];
   const { rows } = await deps.pool.query<EscrowCheckRow>(
-    `SELECT id, state, tokens_held, claim_address FROM payments
+    `SELECT id, state, tokens_held, claim_address, instant FROM payments
       WHERE state IN ('held', 'unlocked')
          OR (state = 'claimed' AND updated_at >= $1)
       ORDER BY created_at
@@ -237,7 +244,43 @@ async function checkOneEntry(deps: ReconcileDeps, row: EscrowCheckRow): Promise<
     );
   }
 
+  lines.push(...(await checkFeeLeg(deps, row)));
+
   return lines;
+}
+
+/**
+ * The fee leg of an instant payment, which the release keeper is allowed to
+ * fail at.
+ *
+ * An instant payment buys two escrow entries: the donation, and the premium
+ * paid into the processor's own project -- with the *payer* as beneficiary of
+ * both. `releaseOne` releases the donation, then tries the fee leg and
+ * tolerates a failure there, on the grounds that a stuck fee entry must not
+ * make a delivered donation look undelivered. That is the right call for the
+ * keeper, and on its own it is also a silent one: the payment reads `claimed`,
+ * the donation entry is settled, nothing is scheduled to try again, and the
+ * payer's $PROCESSOR tokens sit unsettled forever.
+ *
+ * So this is the alarm the keeper's tolerance depends on. `release` is
+ * permissionless onchain, so the fix is a crank anyone can send -- the line
+ * names the entry to send it for.
+ *
+ * Only instant payments have a fee leg (a zero premium never writes one), so a
+ * default-rail payment does not spend an RPC read here, and only a `claimed`
+ * payment is late: while the donation is held or unlocked, an unsettled fee
+ * entry is simply one that has not been released yet.
+ */
+async function checkFeeLeg(deps: ReconcileDeps, row: EscrowCheckRow): Promise<string[]> {
+  if (!row.instant || row.state !== "claimed") return [];
+
+  const feeId = feePaymentId(paymentIdBytes32(row.id));
+  const feeEntry = await deps.escrow.getEntry(feeId);
+  if (!feeEntry || feeEntry.settled) return [];
+
+  return [
+    `payment ${row.id}: delivered, but its fee-leg entry ${feeId} is still unsettled onchain (${feeEntry.amount} tokens for ${feeEntry.beneficiary}) -- release is permissionless, crank it`,
+  ];
 }
 
 /**
@@ -431,7 +474,40 @@ async function checkRestingBalance(deps: ReconcileDeps): Promise<string[]> {
 }
 
 /**
- * (f) Yesterday's chargebacks, against what the state machine did about them.
+ * (f) Instant-pool money that has been earned back but not yet returned.
+ *
+ * The instant rail spends the pool's USDC on a payment the moment it is
+ * charged, and the payer's own money lands days later, in the settlement
+ * wallet. Repaying the pool out of it is a manual transfer -- nothing in this
+ * service moves USDC back to the pool Safe -- so the standing allowance only
+ * ever depletes, and the rail fails closed (`insufficient_pool_headroom` at
+ * checkout) when it runs out.
+ *
+ * That is a deliberate v1 deviation, and this line is what stops it being a
+ * silent one: every draw whose payment has since settled (`held` onward, so
+ * Stripe's money is in) and that no one has marked swept is money the pool is
+ * owed. It reports the total rather than each payment, because the number is
+ * the decision -- how much to move -- and the runbook's UPDATE is what clears
+ * the line.
+ */
+async function checkPoolSweep(deps: ReconcileDeps): Promise<string[]> {
+  const { rows } = await deps.pool.query<{ n: string; cents: string | null }>(
+    `SELECT count(*) AS n, sum(amount_usd_cents + premium_usd_cents) AS cents
+       FROM payments
+      WHERE instant AND pool_draw_tx IS NOT NULL AND pool_swept_at IS NULL
+        AND state IN ('held', 'unlocked', 'claimed')`,
+  );
+  const count = Number(rows[0]?.n ?? "0");
+  if (count === 0) return [];
+
+  const wei = BigInt(rows[0]?.cents ?? "0") * USDC_WEI_PER_CENT;
+  return [
+    `instant pool: ${count} settled instant payment(s) drew ${wei} USDC base units that has not been swept back to the pool -- see "Instant pool operations" in the README; the pool's allowance does not refill itself`,
+  ];
+}
+
+/**
+ * (g) Yesterday's chargebacks, against what the state machine did about them.
  *
  * The webhook's dispute router handles every state it safely can, but it
  * deliberately leaves one alone: a payment in `paying` is mid-send and owned
@@ -485,8 +561,8 @@ async function checkDisputes(deps: ReconcileDeps, now: number): Promise<string[]
  * an automated "fix" applied to a mismatch nobody has understood yet is how a
  * small bug becomes a lost payment.
  *
- * Everything lands in one email. Five separate alarms for one bad night is how
- * an operator learns to filter the alarm folder.
+ * Everything lands in one email. Seven separate alarms for one bad night is
+ * how an operator learns to filter the alarm folder.
  */
 export async function handleReconcile(deps: ReconcileDeps, _job: JobRow): Promise<void> {
   const now = deps.now?.() ?? Date.now();
@@ -501,6 +577,7 @@ export async function handleReconcile(deps: ReconcileDeps, _job: JobRow): Promis
     ...(await runCheck("fatal jobs", () => checkFatalJobs(deps, now))),
     ...(await runCheck("stripe day", () => checkStripeDay(deps, now))),
     ...(await runCheck("resting balance", () => checkRestingBalance(deps))),
+    ...(await runCheck("instant pool sweep", () => checkPoolSweep(deps))),
     ...(await runCheck("disputes", () => checkDisputes(deps, now))),
   ];
 

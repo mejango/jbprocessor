@@ -1,7 +1,7 @@
 import { Pool } from "pg";
 import { zeroAddress, type Address, type Hex } from "viem";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
-import { paymentIdBytes32, type EscrowEntry } from "../src/chain/escrow.js";
+import { feePaymentId, paymentIdBytes32, type EscrowEntry } from "../src/chain/escrow.js";
 import { migrate } from "../src/db/index.js";
 import type { JobRow } from "../src/db/jobs.js";
 import { createPayment, type PaymentState } from "../src/db/payments.js";
@@ -132,6 +132,9 @@ interface SeedOptions {
   unlockAt?: Date | null;
   createdAt?: Date;
   updatedAt?: Date;
+  instant?: boolean;
+  poolDrawTx?: string | null;
+  poolSweptAt?: Date | null;
   /**
    * Defaults to a unique id for any payment past 'created', and to null for a
    * payment still in it -- mirroring the webhook, which writes the intent in
@@ -145,14 +148,15 @@ async function seedPayment(options: SeedOptions): Promise<string> {
     projectId: PROJECT_ID,
     email: "payer@example.com",
     amountUsdCents: options.amountUsdCents ?? 2_500n,
-    instant: false,
+    instant: options.instant ?? false,
     premiumUsdCents: options.premiumUsdCents ?? 0n,
     claimAddress: options.claimAddress ?? BENEFICIARY,
   });
   const defaultIntent = options.state === "created" ? null : `pi_${payment.id}`;
   await pool.query(
     `UPDATE payments SET state = $2, tokens_held = $3, release_tx = $4, unlock_at = $5,
-       created_at = $6, updated_at = $7, stripe_payment_intent = $8
+       created_at = $6, updated_at = $7, stripe_payment_intent = $8,
+       pool_draw_tx = $9, pool_swept_at = $10
      WHERE id = $1`,
     [
       payment.id,
@@ -165,6 +169,8 @@ async function seedPayment(options: SeedOptions): Promise<string> {
       options.stripePaymentIntent === undefined
         ? defaultIntent
         : options.stripePaymentIntent,
+      options.poolDrawTx ?? null,
+      options.poolSweptAt ?? null,
     ],
   );
   return payment.id;
@@ -544,6 +550,120 @@ describe("handleReconcile", () => {
 
     expect(alertText()).toMatch(/rpc timeout/);
     expect(alertText()).toContain(stuck);
+  });
+
+  describe("fee leg", () => {
+    const RELEASE_TX = `0x${"b".repeat(64)}`;
+
+    it("flags a delivered instant payment whose fee leg never settled", async () => {
+      // What `releaseOne` leaves behind when the fee release fails: the payer
+      // has their donation tokens, the payment reads 'claimed', and their
+      // $PROCESSOR tokens are still in escrow with nothing scheduled to move
+      // them.
+      const id = await seedPayment({
+        state: "claimed",
+        instant: true,
+        premiumUsdCents: 37n,
+        releaseTx: RELEASE_TX,
+      });
+      escrow.seed(paymentIdBytes32(id), { settled: true });
+      escrow.seed(feePaymentId(paymentIdBytes32(id)), { settled: false, amount: 42n });
+
+      await handleReconcile(deps(), RECONCILE_JOB);
+
+      expect(alertText()).toContain(id);
+      expect(alertText()).toContain(feePaymentId(paymentIdBytes32(id)));
+      expect(alertText()).toMatch(/fee-leg/i);
+    });
+
+    it("says nothing when the fee leg settled with the donation", async () => {
+      const id = await seedPayment({
+        state: "claimed",
+        instant: true,
+        premiumUsdCents: 37n,
+        releaseTx: RELEASE_TX,
+      });
+      escrow.seed(paymentIdBytes32(id), { settled: true });
+      escrow.seed(feePaymentId(paymentIdBytes32(id)), { settled: true });
+
+      await handleReconcile(deps(), RECONCILE_JOB);
+
+      expect(resend.sent).toHaveLength(0);
+    });
+
+    it("does not look for a fee leg on a default-rail payment", async () => {
+      // A non-instant payment has no premium and therefore no fee entry. Even
+      // with one seeded, the check must not read it -- the id is derived, and
+      // a stray entry under it is not this payment's business.
+      const id = await seedPayment({ state: "claimed", releaseTx: RELEASE_TX });
+      escrow.seed(paymentIdBytes32(id), { settled: true });
+      escrow.seed(feePaymentId(paymentIdBytes32(id)), { settled: false });
+
+      await handleReconcile(deps(), RECONCILE_JOB);
+
+      expect(resend.sent).toHaveLength(0);
+    });
+
+    it("leaves an unsettled fee leg alone while the donation is still held", async () => {
+      const id = await seedPayment({ state: "held", instant: true, premiumUsdCents: 37n });
+      escrow.seed(paymentIdBytes32(id));
+      escrow.seed(feePaymentId(paymentIdBytes32(id)), { settled: false });
+
+      await handleReconcile(deps(), RECONCILE_JOB);
+
+      expect(resend.sent).toHaveLength(0);
+    });
+  });
+
+  describe("instant pool sweep", () => {
+    it("reports pool draws whose payments have settled but were never swept", async () => {
+      const id = await seedPayment({
+        state: "claimed",
+        instant: true,
+        amountUsdCents: 2_500n,
+        premiumUsdCents: 37n,
+        releaseTx: `0x${"b".repeat(64)}`,
+        poolDrawTx: `0x${"d".repeat(64)}`,
+      });
+      escrow.seed(paymentIdBytes32(id), { settled: true });
+
+      await handleReconcile(deps(), RECONCILE_JOB);
+
+      // (2500 + 37) cents, in 6-decimal USDC base units.
+      expect(alertText()).toContain("25370000 USDC base units");
+      expect(alertText()).toMatch(/instant pool/i);
+    });
+
+    it("says nothing once the draw is marked swept", async () => {
+      const id = await seedPayment({
+        state: "claimed",
+        instant: true,
+        premiumUsdCents: 37n,
+        releaseTx: `0x${"b".repeat(64)}`,
+        poolDrawTx: `0x${"d".repeat(64)}`,
+        poolSweptAt: NOW,
+      });
+      escrow.seed(paymentIdBytes32(id), { settled: true });
+
+      await handleReconcile(deps(), RECONCILE_JOB);
+
+      expect(resend.sent).toHaveLength(0);
+    });
+
+    it("does not chase a draw whose payment has not settled yet", async () => {
+      // Still 'paying': the pool has fronted the money and Stripe has not paid
+      // it back, so there is nothing to sweep.
+      await seedPayment({
+        state: "paying",
+        instant: true,
+        poolDrawTx: `0x${"d".repeat(64)}`,
+        updatedAt: NOW,
+      });
+
+      await handleReconcile(deps(), RECONCILE_JOB);
+
+      expect(resend.sent).toHaveLength(0);
+    });
   });
 
   describe("resting balance", () => {

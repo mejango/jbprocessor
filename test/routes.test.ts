@@ -5,11 +5,12 @@ import { migrate } from "../src/db/index.js";
 import { createPayment, type PaymentState } from "../src/db/payments.js";
 import {
   centsFromDollars,
-  clientIp,
   handleCheckoutRequest,
   recordCheckoutAttempt,
   type CheckoutRouteDeps,
 } from "../src/http/checkout.js";
+import { handleLoginRequest } from "../src/http/login.js";
+import { attemptKey, clientIp } from "../src/http/rateLimit.js";
 import { handleWebhookRequest, type WebhookRouteDeps } from "../src/http/webhook.js";
 import type { WalletProvider } from "../src/wallets/types.js";
 
@@ -32,8 +33,10 @@ const POOL_ADDRESS = "0x1111111111111111111111111111111111111111";
 const WORKER = "0x2222222222222222222222222222222222222222";
 const PREGEN_WALLET = "0x3333333333333333333333333333333333333333" as `0x${string}`;
 const WEBHOOK_SECRET = "whsec_testsecret_0123456789abcdef";
+const AUTH_SECRET = "routes-test-auth-secret-0123456789";
 
 const CHECKOUT_URL = "https://processor.test/api/checkout";
+const LOGIN_URL = "https://processor.test/api/login";
 
 let pool: Pool;
 
@@ -138,9 +141,11 @@ beforeEach(async () => {
   process.env.INSTANT_POOL_ADDRESS = POOL_ADDRESS;
   process.env.WORKER_ADDRESS = WORKER;
   process.env.STRIPE_WEBHOOK_SECRET = WEBHOOK_SECRET;
+  process.env.AUTH_SECRET = AUTH_SECRET;
   await pool.query("DELETE FROM payments");
   await pool.query("DELETE FROM checkout_attempts");
   await pool.query("DELETE FROM stripe_events");
+  await pool.query("DELETE FROM jobs");
 });
 
 afterEach(() => {
@@ -148,6 +153,7 @@ afterEach(() => {
   delete process.env.INSTANT_POOL_ADDRESS;
   delete process.env.WORKER_ADDRESS;
   delete process.env.STRIPE_WEBHOOK_SECRET;
+  delete process.env.AUTH_SECRET;
 });
 
 describe("centsFromDollars", () => {
@@ -407,7 +413,7 @@ describe("POST /api/checkout", () => {
     // Age every one of them out of the window.
     await pool.query(
       "UPDATE checkout_attempts SET created_at = now() - interval '2 minutes' WHERE ip = $1",
-      [ip],
+      [attemptKey("checkout", ip)],
     );
 
     expect(await recordCheckoutAttempt(pool, ip)).toBe(true);
@@ -416,7 +422,7 @@ describe("POST /api/checkout", () => {
     // by the limiter itself, with no sweeper behind it.
     const { rows } = await pool.query<{ n: string }>(
       "SELECT count(*)::text AS n FROM checkout_attempts WHERE ip = $1",
-      [ip],
+      [attemptKey("checkout", ip)],
     );
     expect(rows[0]?.n).toBe("1");
   });
@@ -431,14 +437,14 @@ describe("POST /api/checkout", () => {
     }
     await pool.query(
       "UPDATE checkout_attempts SET created_at = now() - interval '2 minutes' WHERE ip = ANY($1)",
-      [gone],
+      [gone.map((ip) => attemptKey("checkout", ip))],
     );
 
     expect(await recordCheckoutAttempt(pool, freshIp())).toBe(true);
 
     const { rows } = await pool.query<{ n: string }>(
       "SELECT count(*)::text AS n FROM checkout_attempts WHERE ip = ANY($1)",
-      [gone],
+      [gone.map((ip) => attemptKey("checkout", ip))],
     );
     expect(rows[0]?.n).toBe("0");
   });
@@ -458,7 +464,7 @@ describe("POST /api/checkout", () => {
 
     const { rows } = await pool.query<{ n: string }>(
       "SELECT count(*)::text AS n FROM checkout_attempts WHERE ip = $1",
-      [ip],
+      [attemptKey("checkout", ip)],
     );
     expect(rows[0]?.n).toBe("10");
   });
@@ -470,9 +476,94 @@ describe("POST /api/checkout", () => {
 
     const { rows } = await pool.query<{ n: string }>(
       "SELECT count(*)::text AS n FROM checkout_attempts WHERE ip = $1",
-      [ip],
+      [attemptKey("checkout", ip)],
     );
     expect(rows[0]?.n).toBe("1");
+  });
+});
+
+describe("POST /api/login", () => {
+  /** A login POST from `ip`, JSON-encoded unless `form` is set. */
+  function loginRequest(
+    email: string,
+    options: { ip?: string; form?: boolean } = {},
+  ): Request {
+    const headers: Record<string, string> = {
+      "x-forwarded-for": options.ip ?? freshIp(),
+    };
+
+    if (options.form) {
+      headers["content-type"] = "application/x-www-form-urlencoded";
+      return new Request(LOGIN_URL, {
+        method: "POST",
+        headers,
+        body: new URLSearchParams({ email }),
+      });
+    }
+
+    headers["content-type"] = "application/json";
+    return new Request(LOGIN_URL, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ email }),
+    });
+  }
+
+  it("queues a link and answers the same way whatever the address", async () => {
+    const ip = freshIp();
+    const known = await handleLoginRequest({ pool }, loginRequest("payer@example.com", { ip }));
+    const unknown = await handleLoginRequest({ pool }, loginRequest("nobody@example.com", { ip }));
+
+    expect(known.status).toBe(200);
+    expect(unknown.status).toBe(200);
+    expect(await known.json()).toEqual({ ok: true });
+
+    const { rows } = await pool.query<{ n: string }>(
+      "SELECT count(*)::text AS n FROM jobs WHERE kind = 'magic-link-email'",
+    );
+    expect(rows[0]?.n).toBe("2");
+  });
+
+  it("sends a form post back to the check-your-email page", async () => {
+    const response = await handleLoginRequest(
+      { pool },
+      loginRequest("form@example.com", { form: true }),
+    );
+
+    expect(response.status).toBe(303);
+    expect(response.headers.get("location")).toContain("/login?sent=1");
+  });
+
+  it("rate-limits a burst from one address, and only that address", async () => {
+    // The per-address throttle inside `requestMagicLink` cannot stop this: a
+    // caller walking a list of addresses produces a distinct dedupe key every
+    // time, so every request is a real job and a real Resend call.
+    const ip = freshIp();
+    for (let i = 0; i < 10; i += 1) {
+      const ok = await handleLoginRequest({ pool }, loginRequest(`payer${i}@example.com`, { ip }));
+      expect(ok.status).toBe(200);
+    }
+
+    const limited = await handleLoginRequest({ pool }, loginRequest("late@example.com", { ip }));
+    expect(limited.status).toBe(429);
+    expect(((await limited.json()) as { error: string }).error).toBe("rate_limited");
+
+    const other = await handleLoginRequest(
+      { pool },
+      loginRequest("other@example.com", { ip: freshIp() }),
+    );
+    expect(other.status).toBe(200);
+  });
+
+  it("keeps its budget separate from the same address's checkout budget", async () => {
+    const ip = freshIp();
+    for (let i = 0; i < 10; i += 1) {
+      expect(await recordCheckoutAttempt(pool, ip)).toBe(true);
+    }
+
+    // Out of checkout attempts, but signing in is a different thing entirely.
+    const login = await handleLoginRequest({ pool }, loginRequest("payer@example.com", { ip }));
+    expect(login.status).toBe(200);
   });
 });
 

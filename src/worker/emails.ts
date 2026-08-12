@@ -2,7 +2,7 @@ import type { Pool } from "pg";
 import { basescanTx, formatTokens, formatUsdCents } from "../account/format.js";
 import type { JobRow } from "../db/jobs.js";
 import type { PaymentState } from "../db/payments.js";
-import { sendEmail, type EmailDeps } from "../email/send.js";
+import { sendAlert, sendEmail, type EmailDeps } from "../email/send.js";
 import { requireEnv } from "../env.js";
 
 export interface EmailJobDeps extends EmailDeps {
@@ -97,6 +97,23 @@ export async function handleMagicLinkEmail(deps: EmailJobDeps, job: JobRow): Pro
       "-- JBProcessor",
     ].join("\n"),
   });
+}
+
+/**
+ * Mails an alert that was composed somewhere that must not send mail itself.
+ *
+ * The Stripe webhook is the caller that needs this: it runs in the web
+ * process, inside the transaction that consumes the event id, and a mail
+ * provider that times out there would roll the event back and replay the whole
+ * handler. So the webhook writes the alert it wants sent and this delivers it,
+ * with the queue's retries behind it.
+ *
+ * Deliberately not a template: the subject and body arrive whole. Anything
+ * that needs the payment's own numbers already has them at the point it
+ * decided to alert.
+ */
+export async function handleOpsAlert(deps: EmailJobDeps, job: JobRow): Promise<void> {
+  await sendAlert(deps, payloadString(job, "subject"), payloadString(job, "text"));
 }
 
 /** Confirms the donation and explains the hold. Sent once the tokens are escrowed. */

@@ -117,7 +117,7 @@ createdb jbprocessor && createdb jbprocessor_test
 cp .env.example .env            # then fill it in
 
 npm run build:worker && npm run migrate     # apply migrations
-npm test                                     # 269 tests, needs jbprocessor_test
+npm test                                     # 300 tests, needs jbprocessor_test
 npm run dev                                  # web, on :3000
 npm run worker                               # worker, in a second shell
 ```
@@ -285,6 +285,53 @@ Forfeited tokens land with the **owner Safe**, not the operator. Cashing them ou
 deliberately so: cash out through the project's terminal from the Safe, at a time and size
 someone has chosen.
 
+### A refund is issued
+
+A refund on a payment still in `paid` is clean: the state machine moves it to `refunded` and
+nothing was ever bought. A refund on a payment in `held`, `unlocked` or `claimed` is a **double
+give** — the card is credited and the tokens stay bought — so the webhook queues an
+`[JBProcessor] Refund on a payment whose tokens are escrowed` alert instead, and changes nothing.
+
+Deciding is a human's job, and there is a deadline: `forfeit` reverts once `unlockAt` passes.
+Within the window, queue one the same way the dispute runbook does. Once the entry is settled
+the tokens are gone and the alert says so; the loss is the processor's.
+
+Most of these are self-inflicted — a refund issued from the Stripe dashboard without the escrow
+in view. Check the payment's state before refunding, not after.
+
+### Instant pool operations
+
+The instant rail is a loan. A payer who pays the premium gets their tokens bought immediately,
+out of USDC the **pool Safe** has approved the worker to spend; their own money arrives from
+Stripe days later, in the **settlement wallet**. Nothing in this service moves it back. The
+allowance therefore only ever depletes, and repaying the pool is a manual sweep.
+
+**How the headroom depletes.** Checkout reserves `amount + premium` for every instant payment
+in `created`/`paid`/`paying`, and subtracts the lot from `USDC.allowance(pool, worker)`. A draw
+spends the allowance permanently; an abandoned checkout only pins headroom until reconciliation
+cancels it a day later. When headroom runs out the rail **fails closed**: checkout refuses new
+instant payments with `insufficient_pool_headroom` (503) and the default rail keeps working.
+Nothing is ever paid out of funds that are not there.
+
+**The sweep.** Reconciliation reports the outstanding balance every day (*instant pool: N
+settled instant payment(s) drew …*). To clear it:
+
+1. Confirm the settlement wallet actually holds the USDC — the same balance the resting-balance
+   check reads. Money still owed by Stripe has not landed yet.
+2. Transfer that USDC from the settlement wallet to the pool Safe.
+3. Re-approve the allowance from the pool Safe to `WORKER_ADDRESS`, back up to the working
+   ceiling. The transfer alone does not restore headroom — the allowance is what checkout reads.
+4. Mark what you swept, which is what clears the reconciliation line:
+
+```sql
+UPDATE payments SET pool_swept_at = now(), updated_at = now()
+ WHERE instant AND pool_draw_tx IS NOT NULL AND pool_swept_at IS NULL
+   AND state IN ('held', 'unlocked', 'claimed');
+```
+
+Sweep after moving the money, never before: the column is a record of a transfer that happened,
+and marking first would silence the only alarm that says it didn't.
+
 ### Reconciliation alerts
 
 One email a day, `[JBProcessor] Reconciliation found N discrepancies`, listing everything at
@@ -308,6 +355,12 @@ once. Nothing is ever auto-corrected (bar cancelling checkouts nobody completed)
   succeeded charge on the account, including another integration's, and a checkout that
   straddles midnight lands on either side.
 - *disputed but still '<state>'* — see the dispute runbook. Never auto-forfeited.
+- *delivered, but its fee-leg entry … is still unsettled* — the release keeper delivers the
+  donation and tolerates a failure on the premium leg, so the payment reads `claimed` while the
+  payer's $PROCESSOR tokens are still escrowed. `release` is permissionless: crank
+  `escrow.release(<fee entry id>)` from any funded account.
+- *instant pool: N settled instant payment(s) drew …* — the pool is owed. See "Instant pool
+  operations". This line repeats daily until the sweep is recorded, by design.
 
 ### Adding an eligible project
 
@@ -358,6 +411,31 @@ UPDATE projects SET status = 'active' WHERE project_id = <id>;
 Do **not** clear `ruleset_fingerprint` — it already holds the new terms, which is exactly what
 the next scan should compare against. Payments already in flight are unaffected either way:
 they were quoted and bought under the old terms.
+
+---
+
+## Spec deviations (v1)
+
+Three things the design describes as automated are operational today. Each is a deliberate v1
+call, written down here so nobody has to read the code to discover it.
+
+- **Rolling reserve on premium revenue — manual.** The premium accrues (in the settlement
+  wallet, or as $PROCESSOR tokens when `PROCESSOR_*` is configured) and nothing holds a
+  percentage of it back against future chargebacks. The escrow already covers the loss a
+  chargeback creates, so the reserve is a second-order buffer, not the protection; treat the
+  balance as spoken for and size withdrawals accordingly.
+- **Dispute-rate monitoring — manual, via the Stripe dashboard.** Card networks threshold on
+  dispute *rate*, and crossing one costs the account, not a payment. This service reports
+  individual disputes (the daily reconciliation names each one) but computes no rate and knows
+  nothing about the thresholds. Watch Stripe's own Radar/dispute metrics.
+- **The account page reads the database only.** `/account` and `/api/payments/[id]` serve rows
+  from `payments`, not indexed chain state, and deliberately so: every fact on that page
+  (tokens held, destination, release tx) is one this service wrote when it made the
+  transaction, and reconciliation is what checks those rows against the chain. A payer who
+  wants the chain's own answer has the transaction hash to follow.
+
+Also worth knowing, though it is a property rather than a deviation: a refund and a chargeback
+are not interchangeable. See "A refund is issued".
 
 ---
 

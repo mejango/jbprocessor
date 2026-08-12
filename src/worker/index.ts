@@ -7,6 +7,7 @@ import { liveResend } from "../email/send.js";
 import { requireEnv } from "../env.js";
 import {
   handleMagicLinkEmail,
+  handleOpsAlert,
   handleReceiptEmail,
   handleRedirectEmail,
   handleReleaseEmail,
@@ -61,6 +62,7 @@ export const handlers: Record<string, JobHandler> = {
   "ruleset-watch": handleRulesetWatch,
   reconcile: handleReconcile,
   "magic-link-email": handleMagicLinkEmail,
+  "ops-alert": handleOpsAlert,
   "receipt-email": handleReceiptEmail,
   "unlock-email": handleUnlockEmail,
   "redirect-email": handleRedirectEmail,

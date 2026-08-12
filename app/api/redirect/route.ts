@@ -1,7 +1,7 @@
 import { RedirectError, requestRedirect } from "../../../src/account/redirect.js";
 import { sessionFromCookieHeader } from "../../../src/auth/magic.js";
 import { getPool } from "../../../src/db/index.js";
-import { readRequestFields } from "../fields.js";
+import { readRequestFields } from "../../../src/http/fields.js";
 
 /**
  * Points a payment's escrowed tokens at a different address. Optional by

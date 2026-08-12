@@ -29,6 +29,16 @@ export interface PayJobPayload {
 export interface ForfeitJobPayload {
   paymentId: string;
 }
+/**
+ * A ready-written operator alert, mailed by the worker. The subject and body
+ * are composed here (this is where the facts are) and queued rather than sent,
+ * so the mail provider is a retried job and never something that can fail a
+ * webhook -- a 500 back to Stripe would replay the whole event.
+ */
+export interface OpsAlertJobPayload {
+  subject: string;
+  text: string;
+}
 
 /** The slice of the Stripe SDK the webhook router reads from. */
 export interface StripePaymentIntentReader {
@@ -235,6 +245,21 @@ async function handleAsyncPaymentSucceeded(
   const paymentIntentId = refId(session.payment_intent) ?? payment.stripe_payment_intent;
   const charge = paymentIntentId ? await retrieveCharge(deps, paymentIntentId) : null;
 
+  // The hold is re-anchored here, not left where `completed` put it. An ACH
+  // debit is only *submitted* at `completed` and can take days to clear, and
+  // the hold exists to outlast the window in which the payer's bank can
+  // reverse it -- which starts now, not at submission. Left alone, a slow
+  // debit yields an escrow entry that is already unlocked (or nearly) the
+  // moment it is written. Always `bank`: this event only ever fires for a
+  // delayed-notification rail, and the card path never reaches here.
+  //
+  // State stays 'paid' -- this is a patch, not a move -- and it happens before
+  // the pay is scheduled, so the payer worker can only ever read the final
+  // value.
+  await transition(db, paymentId, ["paid"], "paid", {
+    unlock_at: unlockAtFor("bank", Date.now()),
+  });
+
   await schedulePay(db, paymentId, payment.instant, charge);
 }
 
@@ -279,6 +304,42 @@ async function handleDisputeCreated(
   // Every other state is terminal or already resolved.
 }
 
+/**
+ * States in which a refund means the payer has been given their money back
+ * *and* keeps tokens this service already bought them.
+ */
+const ESCROWED_STATES: PaymentState[] = ["held", "unlocked", "claimed"];
+
+/** What a refund on an escrowed payment tells the operator to do about it. */
+function refundAlertText(payment: PaymentSummary): string {
+  const stillRecoverable = payment.state !== "claimed";
+  return [
+    "A refund was issued at Stripe for a payment whose tokens are already",
+    "bought and escrowed onchain. The refund is money back to the payer; the",
+    "tokens are a second give, and nothing here has clawed them back.",
+    "",
+    `Payment: ${payment.id}`,
+    `State: ${payment.state}`,
+    `Stripe payment intent: ${payment.stripe_payment_intent ?? "unknown"}`,
+    "",
+    stillRecoverable
+      ? [
+          "The entry is not settled yet, so this is still recoverable: forfeit it",
+          "within the unlock window per the refund runbook. `forfeit` reverts once",
+          "`unlockAt` passes, so the window is the deadline, not a suggestion.",
+        ].join("\n")
+      : [
+          "The tokens have already been released to the payer, so there is nothing",
+          "left to forfeit -- the escrow entry is settled and the tokens are gone.",
+          "Recorded here so the loss is a decision someone saw, not a silent one.",
+        ].join("\n"),
+    "",
+    "No state was changed automatically.",
+    "",
+    "-- JBProcessor",
+  ].join("\n");
+}
+
 async function handleChargeRefunded(db: Queryable, charge: Stripe.Charge): Promise<void> {
   const paymentIntentId = refId(charge.payment_intent);
   if (!paymentIntentId) return;
@@ -286,13 +347,33 @@ async function handleChargeRefunded(db: Queryable, charge: Stripe.Charge): Promi
   const payment = await findPaymentByIntent(db, paymentIntentId);
   if (!payment) return;
 
+  // A refund on an escrowed payment is a double-give: the card is credited and
+  // the tokens stay bought. It is also almost always a manual refund an
+  // operator issued from the Stripe dashboard, i.e. a decision made without
+  // the escrow in view. Alerting rather than auto-forfeiting is deliberate --
+  // a refund can be the right call *and* the tokens the right call (a goodwill
+  // refund on a delivered donation), and clawing a payer's tokens back off the
+  // back of a webhook is not a judgement to automate.
+  if (ESCROWED_STATES.includes(payment.state)) {
+    const payload: OpsAlertJobPayload = {
+      subject: `Refund on a payment whose tokens are escrowed (${payment.state})`,
+      text: refundAlertText(payment),
+    };
+    await enqueue(db, "ops-alert", payload, {
+      dedupeKey: `ops-alert:refund:${payment.id}`,
+    });
+    return;
+  }
+
   try {
     await transition(db, payment.id, ["paid"], "refunded");
   } catch (err) {
     if (!(err instanceof TransitionError)) throw err;
-    // The payment has already moved past 'paid' (e.g. the worker paid it
-    // on-chain, or a dispute canceled it first). Refund accounting for those
-    // states is the escrow's job, not a state change here -- no-op.
+    // The payment is in a state this event cannot act on: already refunded or
+    // canceled (nothing left to do), or `paying` -- mid-send and owned by the
+    // payer worker, which issues and records its own drift refunds. If that
+    // send lands anyway the payment becomes `held`, and the daily escrow check
+    // is what reports the entry no state change explains.
   }
 }
 

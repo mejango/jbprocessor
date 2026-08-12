@@ -14,6 +14,7 @@ import {
 } from "../src/email/send.js";
 import {
   handleMagicLinkEmail,
+  handleOpsAlert,
   handleReceiptEmail,
   handleRedirectEmail,
   handleReleaseEmail,
@@ -217,6 +218,26 @@ describe("handleMagicLinkEmail", () => {
   });
 });
 
+describe("handleOpsAlert", () => {
+  it("mails the operator the alert it was handed, whole", async () => {
+    await handleOpsAlert(
+      deps(),
+      jobFor("ops-alert", { subject: "Refund on escrowed tokens", text: "payment 1234" }),
+    );
+
+    const sent = resend.sent[0]!;
+    expect(sent.to).toBe("ops@jbprocessor.test");
+    expect(sent.subject).toBe("[JBProcessor] Refund on escrowed tokens");
+    expect(sent.text).toBe("payment 1234");
+  });
+
+  it("throws on a payload with no body, rather than mailing an empty alert", async () => {
+    await expect(
+      handleOpsAlert(deps(), jobFor("ops-alert", { subject: "Something happened" })),
+    ).rejects.toThrow(/text/);
+  });
+});
+
 describe("handleReceiptEmail", () => {
   it("renders the amount, tokens, destination and project name", async () => {
     const id = await seedPayment();
@@ -300,6 +321,7 @@ describe("registry", () => {
       "unlock-email",
       "redirect-email",
       "release-email",
+      "ops-alert",
     ]) {
       expect(handlers[kind], `no handler for ${kind}`).toBeTypeOf("function");
     }
