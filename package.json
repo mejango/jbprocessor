@@ -5,6 +5,7 @@
   "private": true,
   "scripts": {
     "test": "vitest run",
+    "test:fork": "vitest run --no-file-parallelism escrow.fork e2e.fork",
     "dev": "next dev --webpack",
     "build": "next build --webpack",
     "start": "next start",

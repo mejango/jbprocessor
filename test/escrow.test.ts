@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { feePaymentId, paymentIdBytes32 } from "../src/chain/escrow.js";
+import { feePaymentId, paymentIdBytes32, processPayment } from "../src/chain/escrow.js";
 
 describe("paymentIdBytes32", () => {
   it("strips dashes and left-pads a UUID to a 32-byte hex value", () => {
@@ -57,5 +57,63 @@ describe("feePaymentId", () => {
 
   it("throws for a value that isn't a 32-byte hex string", () => {
     expect(() => feePaymentId("0x1234" as `0x${string}`)).toThrow();
+  });
+});
+
+describe("processPayment", () => {
+  const ESCROW = "0x00000000000000000000000000000000000e5c70";
+  const PAYMENT_ID = paymentIdBytes32("550e8400-e29b-41d4-a716-446655440000");
+
+  /**
+   * A client pair that gets as far as a mined transaction and then reports
+   * whatever `status` the case wants. Enough to drive the one branch that
+   * cannot be reached on a fork on demand: a transaction that simulates and
+   * then reverts.
+   */
+  function clients(status: "success" | "reverted", logs: unknown[] = []) {
+    return {
+      publicClient: {
+        simulateContract: async () => ({ request: {} }),
+        waitForTransactionReceipt: async () => ({ status, logs }),
+      },
+      walletClient: {
+        account: { address: "0x0000000000000000000000000000000000000001" },
+        writeContract: async () => `0x${"ab".repeat(32)}`,
+      },
+    } as unknown as Parameters<typeof processPayment>[0];
+  }
+
+  const params = {
+    paymentId: PAYMENT_ID,
+    terminal: "0x00000000000000000000000000000000000f0001",
+    projectId: 1n,
+    usdcAmountWei: 1_000_000n,
+    minReturnedTokens: 0n,
+    projectToken: "0x00000000000000000000000000000000000f0002",
+    beneficiary: "0x00000000000000000000000000000000000f0003",
+    unlockAt: 1_800_000_000,
+    memo: "test",
+  } as unknown as Parameters<typeof processPayment>[1];
+
+  it("reports a reverted transaction as a revert, not as a missing event", async () => {
+    process.env.ESCROW_ADDRESS = ESCROW;
+    try {
+      await expect(processPayment(clients("reverted"), params)).rejects.toThrow(
+        /reverted onchain/,
+      );
+    } finally {
+      delete process.env.ESCROW_ADDRESS;
+    }
+  });
+
+  it("still reports a missing event when the transaction did succeed", async () => {
+    process.env.ESCROW_ADDRESS = ESCROW;
+    try {
+      await expect(processPayment(clients("success"), params)).rejects.toThrow(
+        /no Processed event/,
+      );
+    } finally {
+      delete process.env.ESCROW_ADDRESS;
+    }
   });
 });

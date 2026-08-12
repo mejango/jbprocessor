@@ -163,6 +163,15 @@ export async function processPayment(
 
   const txHash = await walletClient.writeContract(request);
   const receipt = await publicClient.waitForTransactionReceipt({ hash: txHash });
+  // A successful simulation is not a successful transaction: state can move
+  // between the two, and a pay routed through a data hook (a revnet's buyback
+  // hook, say) can revert on a swap that simulated fine. Checked before the
+  // logs are read, because a reverted transaction has none -- without this the
+  // failure surfaces as "no Processed event", which reads like an ABI problem
+  // rather than the revert it is.
+  if (receipt.status !== "success") {
+    throw new Error(`processPayment: transaction ${txHash} reverted onchain`);
+  }
 
   const events = parseEventLogs({
     abi: escrowAbi,
