@@ -4,6 +4,7 @@ import type Stripe from "stripe";
 import { migrate } from "../src/db/index.js";
 import { createCheckoutSession, CheckoutError } from "../src/stripe/checkout.js";
 import type { CheckoutDeps } from "../src/stripe/checkout.js";
+import type { QuoteTokensParams } from "../src/chain/quote.js";
 import type { WalletProvider } from "../src/wallets/types.js";
 
 const TEST_DATABASE_URL =
@@ -55,15 +56,21 @@ class WalletStub implements WalletProvider {
 
 const QUOTE_TOKENS = 4242n * 10n ** 18n;
 
-/** Captures the args quoteTokens forwards to previewPayFor. */
-function quoteClientStub() {
-  const calls: unknown[] = [];
+/** Captures the params checkout hands the quote. */
+function quoteReadsStub(beneficiaryTokenCount = QUOTE_TOKENS) {
+  const calls: QuoteTokensParams[] = [];
   return {
     calls,
-    readContract: async (args: { args: readonly unknown[] }) => {
-      calls.push(args.args);
-      return [{}, QUOTE_TOKENS, 0n, []] as const;
+    previewPayFor: async (params: QuoteTokensParams) => {
+      calls.push(params);
+      return {
+        weight: 0n,
+        rulesetMetadata: 0n,
+        beneficiaryTokenCount,
+        hookAmounts: [] as bigint[],
+      };
     },
+    pricePerUnit: async () => 1_000_000n,
   };
 }
 
@@ -83,7 +90,7 @@ function deps(overrides: Partial<CheckoutDeps> = {}): TestDeps {
     pool,
     stripe,
     wallets,
-    quoteClient: quoteClientStub() as unknown as CheckoutDeps["quoteClient"],
+    quoteReads: quoteReadsStub() as unknown as CheckoutDeps["quoteReads"],
     readAllowance: async () => 1_000_000_000n,
     ...overrides,
   } as unknown as CheckoutDeps & { stripe: StripeStub; wallets: WalletStub };
@@ -416,8 +423,8 @@ describe("createCheckoutSession -- happy path", () => {
   });
 
   it("quotes against the project's terminal with cents converted to 6-decimal USDC wei", async () => {
-    const quote = quoteClientStub();
-    const d = deps({ quoteClient: quote as unknown as CheckoutDeps["quoteClient"] });
+    const quote = quoteReadsStub();
+    const d = deps({ quoteReads: quote as unknown as CheckoutDeps["quoteReads"] });
     await createCheckoutSession(d, {
       projectId: PROJECT_ID,
       amountUsdCents: 5000n,
@@ -427,9 +434,33 @@ describe("createCheckoutSession -- happy path", () => {
 
     // $50.00 -> 50_000000 (USDC is 6-decimal), never 50e18.
     expect(quote.calls).toHaveLength(1);
-    const args = quote.calls[0] as readonly unknown[];
-    expect(args[0]).toBe(BigInt(PROJECT_ID));
-    expect(args[2]).toBe(50_000_000n);
+    expect(quote.calls[0]?.projectId).toBe(BigInt(PROJECT_ID));
+    expect(quote.calls[0]?.usdcAmountWei).toBe(50_000_000n);
+  });
+
+  it("refuses a project that previews zero tokens", async () => {
+    // Neither the terminal's preview nor the mint-path floor could say what
+    // the donation buys. Selling it would mean quoting the payer nothing, a
+    // drift gate comparing zero against zero, and a send with no slippage
+    // floor -- so it is refused before any row is written.
+    const d = deps({
+      quoteReads: quoteReadsStub(0n) as unknown as CheckoutDeps["quoteReads"],
+    });
+
+    await expect(
+      createCheckoutSession(d, {
+        projectId: PROJECT_ID,
+        amountUsdCents: 5000n,
+        email: "unquotable@example.com",
+        instant: false,
+      }),
+    ).rejects.toMatchObject({ code: "project_unquotable" });
+
+    expect(d.stripe.calls).toHaveLength(0);
+    const { rows } = await pool.query("SELECT 1 FROM payments WHERE email = $1", [
+      "unquotable@example.com",
+    ]);
+    expect(rows).toHaveLength(0);
   });
 
   it("charges the donation only for a default payment", async () => {
@@ -444,9 +475,9 @@ describe("createCheckoutSession -- happy path", () => {
   });
 
   it("adds the instant premium to the charged amount but not to the quoted donation", async () => {
-    const quote = quoteClientStub();
+    const quote = quoteReadsStub();
     const d = deps({
-      quoteClient: quote as unknown as CheckoutDeps["quoteClient"],
+      quoteReads: quote as unknown as CheckoutDeps["quoteReads"],
       readAllowance: async () => 1_000_000_000n,
     });
     await createCheckoutSession(d, {
@@ -460,7 +491,7 @@ describe("createCheckoutSession -- happy path", () => {
     expect(d.lastCallUnitAmount()).toBe(5075);
     // The premium is a service fee -- the donation quoted (and later paid
     // on-chain) is still the donation amount.
-    expect((quote.calls[0] as readonly unknown[])[2]).toBe(50_000_000n);
+    expect(quote.calls[0]?.usdcAmountWei).toBe(50_000_000n);
   });
 
   it("persists the premium so reconciliation never re-derives it from PREMIUM_BPS", async () => {

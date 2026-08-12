@@ -29,6 +29,40 @@ expired) → `claimed` (tokens delivered). `refunded`, `canceled` and `forfeited
 | Chain layer | `src/chain/` | viem clients, the `previewPayFor` quote, and the escrow writes (simulate → send → confirm the receipt). |
 | Accounts | `src/auth/`, `src/wallets/` | Magic links (HMAC tokens, single-use via `used_tokens`) and Para pregenerated wallets, memoized one-per-email. |
 
+### Quoting
+
+What a donation buys is normally `previewPayFor`'s `beneficiaryTokenCount`. But that reports
+only what the *terminal mints*, and a revnet's data hook hands the whole payment to the buyback
+hook, which acquires tokens by swapping on an AMM instead — so for those projects the preview
+is zero while the payer in fact receives plenty.
+
+Taken at face value that zero is corrosive: the payer is quoted nothing, the drift gate
+compares zero against zero and never refunds, and `minTokensForQuote(0)` is 0, so the on-chain
+send carries no slippage floor. So when the preview is zero *because* a pay hook claimed the
+entire payment, `src/chain/quote.ts` falls back to the **mint-path floor** — what the terminal
+would have minted had no hook intervened, mirroring `JBTerminalStore._computePayFrom` and
+`JBController._splitTokenCount`:
+
+```
+weightRatio = amountCurrency == baseCurrency ? 10**decimals
+                                             : JBPrices.pricePerUnitOf(...)
+tokenCount  = amountUsdc * weight / weightRatio
+floor       = tokenCount * (10000 - reservedPercent) / 10000
+```
+
+It is a true lower bound because the buyback hook only routes to the AMM when the swap beats
+minting; when it doesn't, it mints, and the payer receives exactly this number.
+
+Two details that are easy to get wrong, and are wrong in the obvious implementation. The
+accounting context's currency is `uint32(uint160(token))` while a ruleset's `baseCurrency` is a
+`JBCurrencyIds` value (USD = 2) — they are different namespaces and almost never equal, so the
+price read is the normal path, not the exception. And that price is genuinely not 1:
+`pricePerUnitOf(6, USDC, USD, 6)` returns `1000189` on Base, a live Chainlink USDC/USD feed.
+Assuming `10**6` inflates the floor by ~0.02% and breaks the lower-bound property outright.
+
+A quote of zero from *both* paths is refused at checkout (`project_unquotable`): a project
+whose issuance cannot be described is a project this service will not sell.
+
 Two facts worth holding onto:
 
 - **The web process never signs anything.** `setBeneficiary` and `forfeit` are operator-only
@@ -68,7 +102,7 @@ Every variable, what it does, and which service needs it, is documented in
 | `CARD_CEILING_USD_CENTS` | web | no | `50000` |
 | `BANK_HOLD_DAYS` | web | no | `7` |
 | `DRIFT_TOLERANCE_BPS` | worker | no | `200` |
-| `RESTING_BALANCE_ALERT_WEI` | worker | no | `100000000` |
+| `RESTING_BALANCE_ALERT_USDC` | worker | no | `100000000` |
 
 The card hold is 120 days and is not configurable: it is a property of the card networks, not
 of this deployment.
@@ -139,11 +173,12 @@ Project #6 was chosen from the ten V6 projects on Base because its primary USDC 
 the registry, and calling the multi-terminal for them reverts), and because its ruleset does
 not pause pay.
 
-**Known limitation this surfaced.** Project #6 is a revnet with `useDataHookForPay`, so the
-terminal hands the whole payment to a pay hook (the buyback hook) which acquires tokens by
-swapping rather than minting. `previewPayFor` reports what the *terminal* mints, so it returns
-**zero** beneficiary tokens for such a project. See "Adding an eligible project" below — this
-has to be checked before onboarding, not after.
+**What this project exercises.** #6 is a revnet with `useDataHookForPay`, so the terminal hands
+the whole payment to a pay hook (the buyback hook) which acquires tokens by swapping rather
+than minting. `previewPayFor` reports what the *terminal* mints, so it returns **zero**
+beneficiary tokens for such a project — which is why the quote falls back to the mint-path
+floor (see "Quoting" below). The fork suite asserts the floor really is a lower bound on what
+the payer receives.
 
 ---
 
@@ -177,6 +212,11 @@ Provision a Postgres database and two services from this repository:
 
 Set `DATABASE_URL` on both to `${{Postgres.DATABASE_URL}}` rather than pasting a URL. Set the
 rest from the table above, and keep `WORKER_PRIVATE_KEY` off the web service.
+
+**Order matters on every deploy, first and subsequent.** Deploy the worker first and let its
+`npm run migrate` finish before the web service starts: the web service never migrates, so a
+web instance that boots against a schema older than its code queries columns that do not exist
+yet. On Railway, deploy the worker service, wait for its log line, then deploy web.
 
 ### 3. Stripe
 
@@ -282,13 +322,13 @@ Check, in order:
 3. `JBController.currentRulesetOf(<id>)`: `pausePay` false. Read `reservedPercent` (how much of
    the payer's issuance is skimmed), `cashOutTaxRate`, `allowOwnerMinting` and
    `allowSetCustomToken` and decide whether the deal is one worth selling.
-4. **`previewPayFor(<id>, USDC, <amount>, <beneficiary>, 0x)` returns a non-zero
-   `beneficiaryTokenCount`.** If it returns zero — as it does for a revnet whose data hook
-   routes pay through a buyback hook — then for this project the payer is quoted zero tokens,
-   the refund-on-drift protection never fires (`driftExceeded(0, 0)` is false), and the
-   terminal call carries no slippage floor (`minTokensForQuote(0)` is 0). Tokens still arrive,
-   because the escrow measures what it actually received, but the quote and both protections
-   are inert. Onboarding such a project has to be a decision someone makes on purpose.
+4. The project can be quoted. `previewPayFor(<id>, USDC, <amount>, <beneficiary>, 0x)`
+   returning a non-zero `beneficiaryTokenCount` is the easy case. A **zero** with the pay-hook
+   specifications claiming the full amount is the revnet/buyback case, which the mint-path
+   floor handles (see "Quoting") — check that the ruleset's `weight` is non-zero and its
+   `reservedPercent` is under 10000, or the floor is zero too. A zero with **no** hook claiming
+   the payment means the project genuinely issues nothing; checkout will refuse it with
+   `project_unquotable`, and it cannot be onboarded.
 5. Read the project's onchain terms as a human. The ruleset watcher will suspend the project if
    they change, so what is being recorded here is the deal as it stands today.
 

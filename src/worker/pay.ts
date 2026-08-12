@@ -14,6 +14,7 @@ import {
 } from "../chain/escrow.js";
 import {
   driftExceeded,
+  liveQuoteReads,
   minTokensForQuote,
   quoteTokens,
   USDC_ON_BASE,
@@ -103,13 +104,18 @@ function requireWorkerAccount(clients: ChainClients) {
 
 /** The live `PayChain`, bound to a viem client pair. */
 export function liveChain(clients: ChainClients): PayChain {
+  // Built once per chain instance, not per quote: it memoizes the JBPrices
+  // address it resolves off the controller, and a fresh one per call would
+  // re-read that on every payment.
+  const quoteReads = liveQuoteReads(clients.publicClient);
+
   return {
     assertConfigured: ({ instant }) => {
       requireWorkerAccount(clients);
       escrowAddress();
       if (instant) envAddress("INSTANT_POOL_ADDRESS");
     },
-    quoteTokens: (params) => quoteTokens(clients.publicClient, params),
+    quoteTokens: (params) => quoteTokens(quoteReads, params),
     entryTokensHeld: async (paymentId) => (await getEntry(clients, paymentId))?.amount ?? null,
     processPayment: (params) => processPayment(clients, params),
     drawFromInstantPool: async (amountWei) =>

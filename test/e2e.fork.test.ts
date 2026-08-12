@@ -19,7 +19,7 @@ import { escrowAbi } from "../src/chain/abi/escrow.js";
 import { terminalAbi } from "../src/chain/abi/terminal.js";
 import type { AppPublicClient, AppWalletClient, ChainClients } from "../src/chain/client.js";
 import { paymentIdBytes32 } from "../src/chain/escrow.js";
-import { quoteTokens, USDC_ON_BASE } from "../src/chain/quote.js";
+import { liveQuoteReads, quoteTokens, USDC_ON_BASE } from "../src/chain/quote.js";
 import { migrate } from "../src/db/index.js";
 import { enqueue } from "../src/db/jobs.js";
 import { createPayment, type PaymentState } from "../src/db/payments.js";
@@ -76,7 +76,7 @@ const ANVIL_RPC_URL = `http://127.0.0.1:${ANVIL_PORT}`;
 
 const HOLD_SECONDS = 3600;
 
-/** 25 USDC, in 6-decimal base units. */
+/** A $25.00 donation, in cents -- the unit money is counted in everywhere here. */
 const DONATION_CENTS = 2_500n;
 
 const erc20Abi = parseAbi([
@@ -184,6 +184,8 @@ describe.skipIf(!FORK_RPC_URL)("worker end-to-end (anvil fork of Base)", () => {
   let deps: WorkerDeps;
 
   const operator = privateKeyToAccount(ANVIL_DEFAULT_KEY);
+  /** The floor the quote produced, asserted as a real lower bound below. */
+  let quotedFloor = 0n;
   const beneficiary = getAddress(`0x${"beef".padStart(40, "0")}`);
 
   const publicClient = createPublicClient({
@@ -332,34 +334,16 @@ describe.skipIf(!FORK_RPC_URL)("worker end-to-end (anvil fork of Base)", () => {
   }, FORK_TEST_TIMEOUT_MS);
 
   /**
-   * `quoteTokens` reads `beneficiaryTokenCount` out of `previewPayFor`, and
-   * this checks it reads the right field off the real terminal.
+   * The mint-path floor, against the real hook.
    *
-   * It deliberately does NOT assert the quote is non-zero, because against
-   * this project it is zero, and that is the terminal telling the truth: a
-   * revnet with `useDataHookForPay` hands the whole payment to a pay hook (for
-   * project #6, the buyback hook), which acquires the tokens by swapping
-   * rather than by minting. `previewPayFor` reports what the *terminal* will
-   * mint, so everything a hook will deliver is invisible to it.
-   *
-   * That has three consequences for any such project, and they are the reason
-   * the README's eligibility checklist makes this read a required pre-
-   * onboarding step rather than a nicety:
-   *
-   *   - the payer is quoted zero tokens at checkout, and `/done` and the
-   *     account page show "0 tokens expected" until the pay lands;
-   *   - `driftExceeded(0, 0)` is false, so the refund-on-drift protection
-   *     never fires;
-   *   - `minTokensForQuote(0)` is 0, so the terminal call carries no slippage
-   *     floor.
-   *
-   * The money still arrives -- the escrow measures the tokens it actually
-   * received, which is what the delivery test below proves -- but a project
-   * that previews zero is a project this service cannot quote or protect, and
-   * that has to be a decision someone makes on purpose.
+   * Project #6 is a revnet: `useDataHookForPay` is set, so the terminal mints
+   * nothing and `previewPayFor` reports zero while the buyback hook acquires
+   * the tokens by swapping. `quoteTokens` therefore falls back to the floor --
+   * what the terminal WOULD have minted -- and this is where that fallback
+   * meets reality rather than a stub.
    */
   it(
-    "reads the terminal's own beneficiary-token preview, hooks included",
+    "falls back to the mint-path floor when the buyback hook takes the payment",
     async () => {
       const usdcAmountWei = DONATION_CENTS * 10_000n;
       const preview = await publicClient.readContract({
@@ -371,18 +355,21 @@ describe.skipIf(!FORK_RPC_URL)("worker end-to-end (anvil fork of Base)", () => {
       const beneficiaryTokenCount = preview[1];
       const hookSpecifications = preview[3];
 
-      const quoted = await quoteTokens(publicClient, {
+      // Every base unit is accounted for: the terminal mints against it, or a
+      // pay hook has claimed it. A preview reporting neither would mean the
+      // payment vanishes.
+      const claimedByHooks = hookSpecifications.reduce((sum, spec) => sum + spec.amount, 0n);
+      expect(beneficiaryTokenCount > 0n || claimedByHooks === usdcAmountWei).toBe(true);
+
+      quotedFloor = await quoteTokens(liveQuoteReads(publicClient), {
         terminal: FORK_TERMINAL,
         projectId: FORK_PROJECT_ID,
         usdcAmountWei,
       });
-      expect(quoted).toBe(beneficiaryTokenCount);
+      expect(quotedFloor).toBeGreaterThan(0n);
 
-      // Every base unit is accounted for: either the terminal mints against
-      // it, or a pay hook has claimed it. A preview reporting neither would
-      // mean the payment vanishes.
-      const claimedByHooks = hookSpecifications.reduce((sum, spec) => sum + spec.amount, 0n);
-      expect(beneficiaryTokenCount > 0n || claimedByHooks === usdcAmountWei).toBe(true);
+      // The hook is what makes the preview zero, so the quote must NOT be it.
+      if (beneficiaryTokenCount === 0n) expect(quotedFloor).not.toBe(beneficiaryTokenCount);
     },
     FORK_TEST_TIMEOUT_MS,
   );
@@ -416,6 +403,9 @@ describe.skipIf(!FORK_RPC_URL)("worker end-to-end (anvil fork of Base)", () => {
         amountUsdCents: DONATION_CENTS,
         instant: false,
         claimAddress: beneficiary,
+        // What checkout would have stored: the mint-path floor, since this
+        // project's preview is zero.
+        quoteTokens: quotedFloor,
       });
       await pool.query(
         `UPDATE payments
@@ -452,6 +442,19 @@ describe.skipIf(!FORK_RPC_URL)("worker end-to-end (anvil fork of Base)", () => {
       // point of reading the amount back off the Processed event.
       expect(held.tokens_held).toBe(entry[1].toString());
       expect(entry[1]).toBeGreaterThan(0n);
+
+      // THE lower-bound property. The floor claims the payer receives at least
+      // this much; the buyback hook only swaps when the swap beats minting, so
+      // the tokens actually escrowed must not be fewer. If this ever fails, the
+      // quote is over-promising and `minReturnedTokens` would revert real pays.
+      expect(entry[1]).toBeGreaterThanOrEqual(quotedFloor);
+
+      // And the payer was quoted something, not zero.
+      const { rows: quoted } = await pool.query<{ quote_tokens: string | null }>(
+        "SELECT quote_tokens FROM payments WHERE id = $1",
+        [payment.id],
+      );
+      expect(BigInt(quoted[0]?.quote_tokens ?? "0")).toBe(quotedFloor);
       expect(entry[0].toLowerCase()).toBe(FORK_PROJECT_TOKEN.toLowerCase());
       expect(entry[3]).toBe(false); // not settled
       expect(entry[4].toLowerCase()).toBe(beneficiary.toLowerCase());

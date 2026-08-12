@@ -6,7 +6,7 @@ import {
   quoteTokens,
   USDC_ON_BASE,
   USDC_WEI_PER_CENT,
-  type ReadContractClient,
+  type QuoteReads,
 } from "../chain/quote.js";
 import { createPayment, type Queryable } from "../db/payments.js";
 import { envAddress, envBigInt, requireEnv } from "../env.js";
@@ -31,6 +31,7 @@ export type CheckoutErrorCode =
   | "project_suspended"
   | "invalid_amount"
   | "invalid_wallet_address"
+  | "project_unquotable"
   | "insufficient_pool_headroom"
   | "stripe_session_missing_url";
 
@@ -64,7 +65,7 @@ export interface StripeCheckoutClient {
 export interface CheckoutDeps {
   pool: Queryable;
   stripe: StripeCheckoutClient;
-  quoteClient: ReadContractClient;
+  quoteReads: QuoteReads;
   wallets: WalletProvider;
   /**
    * Reads the USDC allowance the instant pool has granted an address.
@@ -172,7 +173,7 @@ export async function createCheckoutSession(
   deps: CheckoutDeps,
   input: CreateCheckoutSessionInput,
 ): Promise<CreateCheckoutSessionResult> {
-  const { pool, stripe, quoteClient, wallets } = deps;
+  const { pool, stripe, quoteReads, wallets } = deps;
   const readAllowance = deps.readAllowance ?? defaultReadAllowance;
   const { projectId, amountUsdCents, email, instant } = input;
 
@@ -231,11 +232,24 @@ export async function createCheckoutSession(
     claimAddress = await wallets.getOrCreatePregenWallet(email);
   }
 
-  const quotedTokens = await quoteTokens(quoteClient, {
+  const quotedTokens = await quoteTokens(quoteReads, {
     terminal: project.terminal_address as Address,
     projectId: BigInt(projectId),
     usdcAmountWei,
   });
+
+  // A zero quote is never sellable. It means neither the terminal's own
+  // preview nor the mint-path floor could say what this donation buys -- so
+  // there is nothing to show the payer, the drift gate would compare zero
+  // against zero and never refund, and the on-chain send would carry no
+  // slippage floor. Refusing here is the one place that can stop a payment
+  // whose protections are all inert from being taken at all.
+  if (quotedTokens === 0n) {
+    throw new CheckoutError(
+      "project_unquotable",
+      `project ${projectId} previews zero tokens for ${usdcAmountWei} USDC base units`,
+    );
+  }
 
   // The premium buys the payer an immediate on-chain pay out of the instant
   // pool; it's a service fee on top of the donation, so it's charged by

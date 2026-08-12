@@ -548,7 +548,7 @@ describe("handleReconcile", () => {
 
   describe("resting balance", () => {
     afterEach(() => {
-      delete process.env.RESTING_BALANCE_ALERT_WEI;
+      delete process.env.RESTING_BALANCE_ALERT_USDC;
     });
 
     it("says nothing while the settlement wallet is at or under the threshold", async () => {
@@ -568,8 +568,8 @@ describe("handleReconcile", () => {
       expect(alertText()).toContain("100000000 alert threshold");
     });
 
-    it("honours RESTING_BALANCE_ALERT_WEI", async () => {
-      process.env.RESTING_BALANCE_ALERT_WEI = "500000000"; // 500 USDC
+    it("honours RESTING_BALANCE_ALERT_USDC", async () => {
+      process.env.RESTING_BALANCE_ALERT_USDC = "500000000"; // 500 USDC
       escrow.settlementBalance = 250_000_000n;
 
       await handleReconcile(deps(), RECONCILE_JOB);

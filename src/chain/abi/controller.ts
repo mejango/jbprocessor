@@ -73,4 +73,14 @@ export const controllerAbi = [
     inputs: [{ name: "projectId", type: "uint256" }],
     outputs: rulesetOutputs,
   },
+  // The controller's price oracle, so the mint-path floor quote can find
+  // JBPrices without a second configured address: JB_CONTROLLER_ADDRESS is
+  // already required, and the controller names its own oracle.
+  {
+    type: "function",
+    name: "PRICES",
+    stateMutability: "view",
+    inputs: [],
+    outputs: [{ name: "", type: "address" }],
+  },
 ] as const;

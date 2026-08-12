@@ -49,7 +49,7 @@ const CLAIMED_RECHECK_MS = 7 * DAY_MS;
  * remainder doesn't page anybody, low enough that a single stuck donation
  * (the smallest thing that leaves real money resting) is visible.
  */
-const DEFAULT_RESTING_BALANCE_ALERT_WEI = 100_000_000n;
+const DEFAULT_RESTING_BALANCE_ALERT_USDC = 100_000_000n;
 
 /** The onchain reads the reconciler makes. */
 export interface ReconcileChain {
@@ -421,7 +421,7 @@ async function checkStripeDay(deps: ReconcileDeps, now: number): Promise<string[
  * there may be no row to point at.
  */
 async function checkRestingBalance(deps: ReconcileDeps): Promise<string[]> {
-  const threshold = envBigInt("RESTING_BALANCE_ALERT_WEI", DEFAULT_RESTING_BALANCE_ALERT_WEI);
+  const threshold = envBigInt("RESTING_BALANCE_ALERT_USDC", DEFAULT_RESTING_BALANCE_ALERT_USDC);
   const balance = await deps.escrow.settlementUsdcBalance();
   if (balance <= threshold) return [];
 

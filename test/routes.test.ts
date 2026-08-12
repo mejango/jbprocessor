@@ -8,9 +8,9 @@ import {
   clientIp,
   handleCheckoutRequest,
   recordCheckoutAttempt,
+  type CheckoutRouteDeps,
 } from "../src/http/checkout.js";
 import { handleWebhookRequest, type WebhookRouteDeps } from "../src/http/webhook.js";
-import type { CheckoutDeps } from "../src/stripe/checkout.js";
 import type { WalletProvider } from "../src/wallets/types.js";
 
 /**
@@ -58,14 +58,22 @@ class WalletStub implements WalletProvider {
   }
 }
 
-function checkoutDeps(): CheckoutDeps & { stripe: StripeCheckoutStub } {
+function checkoutDeps(): CheckoutRouteDeps & { stripe: StripeCheckoutStub } {
   return {
     pool,
     stripe: new StripeCheckoutStub(),
     wallets: new WalletStub(),
-    quoteClient: { readContract: async () => [{}, 4242n, 0n, []] },
+    quoteReads: {
+      previewPayFor: async () => ({
+        weight: 0n,
+        rulesetMetadata: 0n,
+        beneficiaryTokenCount: 4242n,
+        hookAmounts: [],
+      }),
+      pricePerUnit: async () => 1_000_000n,
+    },
     readAllowance: async () => 10n ** 12n,
-  } as unknown as CheckoutDeps & { stripe: StripeCheckoutStub };
+  } as unknown as CheckoutRouteDeps & { stripe: StripeCheckoutStub };
 }
 
 /** A checkout POST from `ip`, JSON-encoded unless `form` is set. */
@@ -270,6 +278,66 @@ describe("POST /api/checkout", () => {
     expect(((await suspended.json()) as { error: string }).error).toBe("project_suspended");
   });
 
+  it("maps exhausted pool headroom to 503 -- transient, not the caller's fault", async () => {
+    const deps = checkoutDeps();
+    deps.readAllowance = async () => 0n;
+
+    const response = await handleCheckoutRequest(
+      deps,
+      checkoutRequest(
+        { projectId: PROJECT_ID, amountUsd: "10", email: "payer@example.com", instant: true },
+        { ip: freshIp() },
+      ),
+    );
+    expect(response.status).toBe(503);
+    expect(((await response.json()) as { error: string }).error).toBe(
+      "insufficient_pool_headroom",
+    );
+  });
+
+  it("maps a Stripe session with no redirect URL to 502", async () => {
+    const deps = checkoutDeps();
+    deps.stripe.checkout.sessions.create = async () => ({
+      id: "cs_no_url",
+      url: null as unknown as string,
+    });
+
+    const response = await handleCheckoutRequest(
+      deps,
+      checkoutRequest(
+        { projectId: PROJECT_ID, amountUsd: "10", email: "payer@example.com" },
+        { ip: freshIp() },
+      ),
+    );
+    expect(response.status).toBe(502);
+    expect(((await response.json()) as { error: string }).error).toBe(
+      "stripe_session_missing_url",
+    );
+  });
+
+  it("maps an unquotable project to 409", async () => {
+    const deps = checkoutDeps();
+    deps.quoteReads = {
+      previewPayFor: async () => ({
+        weight: 0n,
+        rulesetMetadata: 0n,
+        beneficiaryTokenCount: 0n,
+        hookAmounts: [],
+      }),
+      pricePerUnit: async () => 1_000_000n,
+    };
+
+    const response = await handleCheckoutRequest(
+      deps,
+      checkoutRequest(
+        { projectId: PROJECT_ID, amountUsd: "10", email: "payer@example.com" },
+        { ip: freshIp() },
+      ),
+    );
+    expect(response.status).toBe(409);
+    expect(((await response.json()) as { error: string }).error).toBe("project_unquotable");
+  });
+
   it("rejects an invalid beneficiary address", async () => {
     const response = await handleCheckoutRequest(
       checkoutDeps(),
@@ -351,6 +419,48 @@ describe("POST /api/checkout", () => {
       [ip],
     );
     expect(rows[0]?.n).toBe("1");
+  });
+
+  it("prunes expired rows left by addresses that never come back", async () => {
+    // A flood from rotating addresses is exactly the traffic that leaves the
+    // most rows behind, and none of those addresses ever returns to clean up
+    // after itself -- so the prune has to be global, not per-address.
+    const gone = ["203.0.113.201", "203.0.113.202", "203.0.113.203"];
+    for (const ip of gone) {
+      expect(await recordCheckoutAttempt(pool, ip)).toBe(true);
+    }
+    await pool.query(
+      "UPDATE checkout_attempts SET created_at = now() - interval '2 minutes' WHERE ip = ANY($1)",
+      [gone],
+    );
+
+    expect(await recordCheckoutAttempt(pool, freshIp())).toBe(true);
+
+    const { rows } = await pool.query<{ n: string }>(
+      "SELECT count(*)::text AS n FROM checkout_attempts WHERE ip = ANY($1)",
+      [gone],
+    );
+    expect(rows[0]?.n).toBe("0");
+  });
+
+  it("holds the limit against a simultaneous burst from one address", async () => {
+    // The regression this guards: an INSERT...SELECT gate is not
+    // self-serialising under READ COMMITTED. Every statement in a burst takes
+    // its own snapshot, counts the same pre-burst rows, and inserts -- capping
+    // a sequence of requests while letting a burst straight through, which is
+    // the only traffic shape a rate limit exists to stop.
+    const ip = freshIp();
+    const burst = await Promise.all(
+      Array.from({ length: 12 }, () => recordCheckoutAttempt(pool, ip)),
+    );
+
+    expect(burst.filter(Boolean)).toHaveLength(10);
+
+    const { rows } = await pool.query<{ n: string }>(
+      "SELECT count(*)::text AS n FROM checkout_attempts WHERE ip = $1",
+      [ip],
+    );
+    expect(rows[0]?.n).toBe("10");
   });
 
   it("charges a malformed request its rate-limit slot", async () => {
