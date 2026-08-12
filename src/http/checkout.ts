@@ -108,7 +108,17 @@ export async function handleCheckoutRequest(
     return Response.json({ error: "rate_limited" }, { status: 429 });
   }
 
-  const { fields } = await readRequestFields(request);
+  const { fields, isForm } = await readRequestFields(request);
+
+  // The no-JavaScript donate form gets redirects instead of JSON: straight to
+  // Stripe on success, back to the form with an error code otherwise. Same
+  // shape as /api/login's form branch.
+  const formErrorRedirect = (code: string) => {
+    const back = new URL(`/donate/${fields.projectId ?? ""}`, request.url);
+    back.searchParams.set("error", code);
+    if (fields.amountUsd) back.searchParams.set("amount", fields.amountUsd);
+    return Response.redirect(back, 303);
+  };
 
   try {
     const projectId = fields.projectId ?? "";
@@ -131,12 +141,15 @@ export async function handleCheckoutRequest(
       instant,
       ...(fields.walletAddress ? { walletAddress: fields.walletAddress } : {}),
     });
+    if (isForm) return Response.redirect(result.url, 303);
     return Response.json(result, { status: 200 });
   } catch (err) {
     if (err instanceof BadRequestError) {
+      if (isForm) return formErrorRedirect("invalid_request");
       return Response.json({ error: "invalid_request", message: err.message }, { status: 400 });
     }
     if (err instanceof CheckoutError) {
+      if (isForm) return formErrorRedirect(err.code);
       return Response.json(
         { error: err.code, message: err.message },
         { status: STATUS_BY_CHECKOUT_CODE[err.code] },

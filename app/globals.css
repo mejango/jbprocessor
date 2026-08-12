@@ -153,6 +153,45 @@ button:hover {
   opacity: 0.9;
 }
 
+form.donate {
+  flex-direction: column;
+  align-items: stretch;
+}
+
+form.donate .grow {
+  width: 100%;
+}
+
+form.donate button {
+  align-self: flex-start;
+}
+
+.advanced {
+  width: 100%;
+  color: var(--muted);
+}
+
+.advanced summary {
+  cursor: pointer;
+  font-size: 0.9rem;
+}
+
+.advanced .field {
+  margin-top: 0.75rem;
+}
+
+.check {
+  display: flex;
+  gap: 0.5rem;
+  align-items: flex-start;
+  margin-top: 0.75rem;
+  font-size: 0.9rem;
+}
+
+.check input {
+  margin-top: 0.3rem;
+}
+
 .notice {
   border-left: 3px solid var(--accent);
   padding: 0.25rem 0 0.25rem 0.85rem;

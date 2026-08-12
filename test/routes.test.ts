@@ -211,7 +211,7 @@ describe("POST /api/checkout", () => {
     expect(rows[0]?.email).toBe("payer@example.com");
   });
 
-  it("accepts a form post as well as JSON", async () => {
+  it("accepts a form post as well as JSON, answering it with a redirect", async () => {
     const response = await handleCheckoutRequest(
       checkoutDeps(),
       checkoutRequest(
@@ -219,7 +219,7 @@ describe("POST /api/checkout", () => {
         { ip: freshIp(), form: true },
       ),
     );
-    expect(response.status).toBe(200);
+    expect(response.status).toBe(303);
 
     const { rows } = await pool.query<{ instant: boolean }>(
       "SELECT instant FROM payments WHERE email = 'form@example.com'",
@@ -717,5 +717,50 @@ describe("POST /api/stripe-webhook", () => {
     await expect(
       handleWebhookRequest(webhookDeps(), webhookRequest(payload, signature)),
     ).rejects.toThrow(/STRIPE_WEBHOOK_SECRET/);
+  });
+});
+
+describe("POST /api/checkout (form branch, the /donate page)", () => {
+  it("redirects a form post straight to Stripe on success", async () => {
+    const response = await handleCheckoutRequest(
+      checkoutDeps(),
+      checkoutRequest(
+        { projectId: PROJECT_ID, amountUsd: "25.50", email: "payer@example.com" },
+        { ip: freshIp(), form: true },
+      ),
+    );
+
+    expect(response.status).toBe(303);
+    expect(response.headers.get("location")).toBe("https://checkout.stripe.com/c/pay/cs_test_1");
+    expect((await pool.query("SELECT 1 FROM payments")).rowCount).toBe(1);
+  });
+
+  it("redirects a form post back to the donate page with the error code", async () => {
+    const response = await handleCheckoutRequest(
+      checkoutDeps(),
+      checkoutRequest(
+        { projectId: SUSPENDED_PROJECT_ID, amountUsd: "10", email: "payer@example.com" },
+        { ip: freshIp(), form: true },
+      ),
+    );
+
+    expect(response.status).toBe(303);
+    const location = new URL(response.headers.get("location") ?? "");
+    expect(location.pathname).toBe(`/donate/${SUSPENDED_PROJECT_ID}`);
+    expect(location.searchParams.get("error")).toBe("project_suspended");
+    expect(location.searchParams.get("amount")).toBe("10");
+    expect((await pool.query("SELECT 1 FROM payments")).rowCount).toBe(0);
+  });
+
+  it("still answers a JSON caller with JSON", async () => {
+    const response = await handleCheckoutRequest(
+      checkoutDeps(),
+      checkoutRequest(
+        { projectId: SUSPENDED_PROJECT_ID, amountUsd: 10, email: "payer@example.com" },
+        { ip: freshIp() },
+      ),
+    );
+    expect(response.status).toBe(409);
+    expect(((await response.json()) as { error: string }).error).toBe("project_suspended");
   });
 });
