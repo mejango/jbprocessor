@@ -19,6 +19,12 @@ contract DeployScript is Script {
         address owner = vm.envAddress("OWNER");
         address operator = vm.envAddress("OPERATOR");
 
+        // The owner's whole job is to be the recovery path when the operator key leaks: it rotates
+        // the operator and receives forfeited tokens. One address in both roles has no such path --
+        // the key that was stolen is the key that would have to fix it -- so this is refused at
+        // deploy time rather than left as a line in the runbook.
+        require(owner != operator, "owner and operator must differ");
+
         vm.startBroadcast();
         escrow = new JBProcessorEscrow(owner, operator, IERC20(BASE_USDC));
         vm.stopBroadcast();

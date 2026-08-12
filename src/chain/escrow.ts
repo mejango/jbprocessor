@@ -76,7 +76,7 @@ export function feePaymentId(paymentId: Hex): Hex {
  * from `src/chain/client.ts` (Task 4), or a same-shape override (e.g. a
  * client pointed at an anvil fork in `test/escrow.fork.test.ts`). Reusing
  * `AppPublicClient`/`AppWalletClient` directly (rather than a hand-rolled
- * structural subset, as `quoteTokens`'s read-only `ReadContractClient`
+ * structural subset, as `quoteTokens`'s read-only `QuoteReads`
  * does) avoids fighting viem's overloaded `simulateContract`/
  * `writeContract` generics -- see the `client.ts` comment on why bare
  * `PublicClient`/`WalletClient` annotations don't typecheck here.

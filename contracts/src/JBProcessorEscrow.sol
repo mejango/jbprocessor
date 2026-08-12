@@ -97,6 +97,15 @@ contract JBProcessorEscrow is Ownable {
 
     /// @notice Redirect where a held entry will release to. Takes effect after REDIRECT_DELAY,
     /// giving monitoring public notice before any redirected release can execute.
+    /// @dev Each call restarts the delay, so an operator can hold one entry hostage: re-queueing a
+    /// redirect every 48 hours keeps `release` reverting with RedirectPending indefinitely. This is
+    /// griefing, not theft -- the tokens cannot leave for anyone but the entry's beneficiary, and
+    /// forfeit is barred once `unlockAt` passes -- and it is the cost of the delay being a real one
+    /// (a cancel path the operator could use, or a delay that didn't restart, would each hand back
+    /// the redirect-to-attacker attack the delay exists to make visible). Recovery is the owner's:
+    /// `setOperator` to an address the attacker does not hold, have the new operator point the entry
+    /// back at the payer, and wait out one final delay -- after which `release` is permissionless
+    /// and anyone can crank it.
     function setBeneficiary(bytes32 paymentId, address to) external onlyOperator {
         Entry storage entry = entries[paymentId];
         if (entry.unlockAt == 0) revert NoEntry();
