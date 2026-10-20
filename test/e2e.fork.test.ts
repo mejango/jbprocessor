@@ -1,4 +1,4 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -15,6 +15,7 @@ import {
 import { privateKeyToAccount } from "viem/accounts";
 import { base } from "viem/chains";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { spawnAnvil } from "./support/anvil.js";
 import { escrowAbi } from "../src/chain/abi/escrow.js";
 import { terminalAbi } from "../src/chain/abi/terminal.js";
 import type { AppPublicClient, AppWalletClient, ChainClients } from "../src/chain/client.js";
@@ -246,11 +247,7 @@ describe.skipIf(!FORK_RPC_URL)("worker end-to-end (anvil fork of Base)", () => {
       [FORK_PROJECT_ID.toString(), FORK_PROJECT_TOKEN, FORK_TERMINAL],
     );
 
-    anvil = spawn(
-      "anvil",
-      ["--fork-url", FORK_RPC_URL as string, "--port", String(ANVIL_PORT), "--silent"],
-      { stdio: "pipe" },
-    );
+    anvil = spawnAnvil(["--fork-url", FORK_RPC_URL as string, "--port", String(ANVIL_PORT), "--silent"]);
     await waitForAnvil();
 
     // The escrow, owned and operated by the same anvil account that signs
