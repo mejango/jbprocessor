@@ -1,4 +1,4 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -14,6 +14,7 @@ import {
 import { privateKeyToAccount } from "viem/accounts";
 import { base } from "viem/chains";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { spawnAnvil } from "./support/anvil.js";
 import { escrowAbi } from "../src/chain/abi/escrow.js";
 import { paymentIdBytes32, processPayment, release } from "../src/chain/escrow.js";
 import { USDC_ON_BASE } from "../src/chain/quote.js";
@@ -124,11 +125,7 @@ describe.skipIf(!FORK_RPC_URL)("escrow (anvil fork)", () => {
   const terminal = FORK_TERMINAL;
 
   beforeAll(async () => {
-    anvil = spawn(
-      "anvil",
-      ["--fork-url", FORK_RPC_URL as string, "--port", String(ANVIL_PORT), "--silent"],
-      { stdio: "pipe" },
-    );
+    anvil = spawnAnvil(["--fork-url", FORK_RPC_URL as string, "--port", String(ANVIL_PORT), "--silent"]);
     await waitForAnvil(ANVIL_RPC_URL);
 
     // Deploy JBProcessorEscrow(owner_ = deployer, operator_ = deployer, usdc = USDC_ON_BASE).
